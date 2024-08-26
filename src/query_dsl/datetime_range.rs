@@ -1,6 +1,6 @@
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
 
     #[allow(non_camel_case_types)]
@@ -12,11 +12,14 @@ mod pg_catalog {
     }
 }
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
+    use crate::misc::timestamp_support::{
+        ZDBDate, ZDBTime, ZDBTimeWithTimeZone, ZDBTimestamp, ZDBTimestampWithTimeZone,
+    };
     use crate::query_dsl::datetime_range::pg_catalog::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -38,18 +41,18 @@ mod dsl {
     #[pg_extern(immutable, parallel_safe, name = "datetime_range")]
     fn datetime_range_date(
         field: &str,
-        lt: Option<default!(Date, NULL)>,
-        gt: Option<default!(Date, NULL)>,
-        lte: Option<default!(Date, NULL)>,
-        gte: Option<default!(Date, NULL)>,
-        boost: Option<default!(f32, NULL)>,
-        relation: Option<default!(Relation, "'intersects'")>,
+        lt: default!(Option<Date>, NULL),
+        gt: default!(Option<Date>, NULL),
+        lte: default!(Option<Date>, NULL),
+        gte: default!(Option<Date>, NULL),
+        boost: default!(Option<f32>, NULL),
+        relation: default!(Option<Relation>, "'intersects'"),
     ) -> ZDBQuery {
-        let datetime_range = DateTimeRange {
-            lt,
-            lte,
-            gt,
-            gte,
+        let datetime_range = DateTimeRange::<ZDBDate> {
+            lt: lt.map(|t| t.into()),
+            lte: lte.map(|t| t.into()),
+            gt: gt.map(|t| t.into()),
+            gte: gte.map(|t| t.into()),
             boost,
             relation,
         };
@@ -59,18 +62,18 @@ mod dsl {
     #[pg_extern(immutable, parallel_safe, name = "datetime_range")]
     fn datetime_range_time(
         field: &str,
-        lt: Option<default!(Time, NULL)>,
-        gt: Option<default!(Time, NULL)>,
-        lte: Option<default!(Time, NULL)>,
-        gte: Option<default!(Time, NULL)>,
-        boost: Option<default!(f32, NULL)>,
-        relation: Option<default!(Relation, "'intersects'")>,
+        lt: default!(Option<Time>, NULL),
+        gt: default!(Option<Time>, NULL),
+        lte: default!(Option<Time>, NULL),
+        gte: default!(Option<Time>, NULL),
+        boost: default!(Option<f32>, NULL),
+        relation: default!(Option<Relation>, "'intersects'"),
     ) -> ZDBQuery {
-        let datetime_range: DateTimeRange<Time> = DateTimeRange {
-            lt,
-            lte,
-            gt,
-            gte,
+        let datetime_range: DateTimeRange<ZDBTime> = DateTimeRange {
+            lt: lt.map(|t| t.into()),
+            lte: lte.map(|t| t.into()),
+            gt: gt.map(|t| t.into()),
+            gte: gte.map(|t| t.into()),
             boost,
             relation,
         };
@@ -80,18 +83,18 @@ mod dsl {
     #[pg_extern(immutable, parallel_safe, name = "datetime_range")]
     fn datetime_range_time_stamp(
         field: &str,
-        lt: Option<default!(Timestamp, NULL)>,
-        gt: Option<default!(Timestamp, NULL)>,
-        lte: Option<default!(Timestamp, NULL)>,
-        gte: Option<default!(Timestamp, NULL)>,
-        boost: Option<default!(f32, NULL)>,
-        relation: Option<default!(Relation, "'intersects'")>,
+        lt: default!(Option<Timestamp>, NULL),
+        gt: default!(Option<Timestamp>, NULL),
+        lte: default!(Option<Timestamp>, NULL),
+        gte: default!(Option<Timestamp>, NULL),
+        boost: default!(Option<f32>, NULL),
+        relation: default!(Option<Relation>, "'intersects'"),
     ) -> ZDBQuery {
-        let datetime_range: DateTimeRange<Timestamp> = DateTimeRange {
-            lt,
-            lte,
-            gt,
-            gte,
+        let datetime_range: DateTimeRange<ZDBTimestamp> = DateTimeRange {
+            lt: lt.map(|ts| ts.into()),
+            lte: lte.map(|ts| ts.into()),
+            gt: gt.map(|ts| ts.into()),
+            gte: gte.map(|ts| ts.into()),
             boost,
             relation,
         };
@@ -101,18 +104,18 @@ mod dsl {
     #[pg_extern(immutable, parallel_safe, name = "datetime_range")]
     fn datetime_range_timestamp_with_timezone(
         field: &str,
-        lt: Option<default!(TimestampWithTimeZone, NULL)>,
-        gt: Option<default!(TimestampWithTimeZone, NULL)>,
-        lte: Option<default!(TimestampWithTimeZone, NULL)>,
-        gte: Option<default!(TimestampWithTimeZone, NULL)>,
-        boost: Option<default!(f32, NULL)>,
-        relation: Option<default!(Relation, "'intersects'")>,
+        lt: default!(Option<TimestampWithTimeZone>, NULL),
+        gt: default!(Option<TimestampWithTimeZone>, NULL),
+        lte: default!(Option<TimestampWithTimeZone>, NULL),
+        gte: default!(Option<TimestampWithTimeZone>, NULL),
+        boost: default!(Option<f32>, NULL),
+        relation: default!(Option<Relation>, "'intersects'"),
     ) -> ZDBQuery {
-        let datetime_range: DateTimeRange<TimestampWithTimeZone> = DateTimeRange {
-            lt,
-            lte,
-            gt,
-            gte,
+        let datetime_range: DateTimeRange<ZDBTimestampWithTimeZone> = DateTimeRange {
+            lt: lt.map(|tsz| tsz.into()),
+            lte: lte.map(|tsz| tsz.into()),
+            gt: gt.map(|tsz| tsz.into()),
+            gte: gte.map(|tsz| tsz.into()),
             boost,
             relation,
         };
@@ -122,18 +125,18 @@ mod dsl {
     #[pg_extern(immutable, parallel_safe, name = "datetime_range")]
     fn datetime_range_time_with_timezone(
         field: &str,
-        lt: Option<default!(TimeWithTimeZone, NULL)>,
-        gt: Option<default!(TimeWithTimeZone, NULL)>,
-        lte: Option<default!(TimeWithTimeZone, NULL)>,
-        gte: Option<default!(TimeWithTimeZone, NULL)>,
-        boost: Option<default!(f32, NULL)>,
-        relation: Option<default!(Relation, "'intersects'")>,
+        lt: default!(Option<TimeWithTimeZone>, NULL),
+        gt: default!(Option<TimeWithTimeZone>, NULL),
+        lte: default!(Option<TimeWithTimeZone>, NULL),
+        gte: default!(Option<TimeWithTimeZone>, NULL),
+        boost: default!(Option<f32>, NULL),
+        relation: default!(Option<Relation>, "'intersects'"),
     ) -> ZDBQuery {
-        let datetime_range: DateTimeRange<TimeWithTimeZone> = DateTimeRange {
-            lt,
-            lte,
-            gt,
-            gte,
+        let datetime_range: DateTimeRange<ZDBTimeWithTimeZone> = DateTimeRange {
+            lt: lt.map(|t| t.into()),
+            lte: lte.map(|t| t.into()),
+            gt: gt.map(|t| t.into()),
+            gte: gte.map(|t| t.into()),
             boost,
             relation,
         };
@@ -156,10 +159,10 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     #[pg_test]
@@ -175,7 +178,8 @@ mod tests {
             'contains'
               );",
         )
-        .expect("didn't get SPI return value");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -210,7 +214,8 @@ mod tests {
             'contains'
               );",
         )
-        .expect("didn't get SPI return value");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -245,7 +250,8 @@ mod tests {
             'contains'
               );",
         )
-        .expect("didn't get SPI return value");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -254,10 +260,10 @@ mod tests {
                 {
                     "range": {
                         "fieldname": {
-                            "lt": "19:34:56-00",
-                            "gt": "04:43:54-00",
-                            "lte": "17:34:24-00",
-                            "gte": "16:45:30-00",
+                            "lt": "12:34:56-0700",
+                            "gt": "21:43:54-0700",
+                            "lte": "10:34:24-0700",
+                            "gte": "09:45:30-0700",
                             "boost": 5.0 as f32,
                             "relation": "contains"
                         }
@@ -280,7 +286,8 @@ mod tests {
             'contains'
               );",
         )
-        .expect("didn't get SPI return value");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -315,7 +322,8 @@ mod tests {
             'contains'
               );",
         )
-        .expect("didn't get SPI return value");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -324,10 +332,10 @@ mod tests {
                 {
                     "range": {
                         "fieldname": {
-                            "lt": "2003-01-02T19:34:56-00",
-                            "gt": "2006-04-06T04:43:54-00",
-                            "lte": "2009-07-08T17:34:24-00",
-                            "gte": "2012-10-11T16:45:30-00",
+                            "lt": "2003-01-02T19:34:56+00:00",
+                            "gt": "2006-04-06T04:43:54+00:00",
+                            "lte": "2009-07-08T17:34:24+00:00",
+                            "gte": "2012-10-11T16:45:30+00:00",
                             "boost": 5.0 as f32,
                             "relation": "contains"
                         }
@@ -340,6 +348,7 @@ mod tests {
     #[pg_test(error = "function dsl.datetime_range(unknown) is not unique")]
     fn test_datetime_range_with_defaults() {
         Spi::get_one::<ZDBQuery>("SELECT dsl.datetime_range('fieldname');")
-            .expect("didn't get SPI return value");
+            .expect("SPI failed")
+            .expect("SPI datum was NULL");
     }
 }

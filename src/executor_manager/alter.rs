@@ -2,8 +2,8 @@ use crate::access_method::options::ZDBIndexOptions;
 use crate::elasticsearch::Elasticsearch;
 use crate::mapping::{categorize_tupdesc, generate_default_mapping};
 use crate::utils::{is_zdb_index, lookup_zdb_index_tupdesc};
-use pgx::{
-    pg_sys, register_xact_callback, warning, IntoDatum, PgBuiltInOids, PgRelation,
+use pgrx::{
+    pg_sys, register_xact_callback, spi, warning, IntoDatum, PgBuiltInOids, PgRelation,
     PgXactCallbackEvent, Spi,
 };
 
@@ -11,7 +11,7 @@ pub fn get_index_options_for_relation(relation: &PgRelation) -> Vec<ZDBIndexOpti
     let mut options = Vec::new();
 
     if relation.is_table() || relation.is_matview() {
-        for index in relation.indicies(pg_sys::AccessShareLock as pg_sys::LOCKMODE) {
+        for index in relation.indices(pg_sys::AccessShareLock as pg_sys::LOCKMODE) {
             if is_zdb_index(&index) {
                 options.push(ZDBIndexOptions::from_relation(&index));
             }
@@ -24,28 +24,27 @@ pub fn get_index_options_for_relation(relation: &PgRelation) -> Vec<ZDBIndexOpti
 }
 
 pub fn get_index_options_for_schema(name: &str) -> Vec<ZDBIndexOptions> {
-    let mut options = Vec::new();
-
     Spi::connect(|client| {
+        let mut options = Vec::new();
         let mut table = client.select("select oid from pg_class
                     where relnamespace = (select oid from pg_namespace where nspname = $1::text::name)
-                      and relam = (select oid from pg_am where amname = 'zombodb')", None, Some(vec![(PgBuiltInOids::TEXTOID.oid(), name.into_datum())]));
+                      and relam = (select oid from pg_am where amname = 'zombodb')", None, Some(vec![(PgBuiltInOids::TEXTOID.oid(), name.into_datum())]))?;
         while table.next().is_some() {
-            let oid = table.get_one::<pg_sys::Oid>().expect("index oid is NULL");
-            let index = PgRelation::with_lock(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let oid = table.get_one::<pg_sys::Oid>()?.expect("index oid is NULL");
+            let index =
+                unsafe { PgRelation::with_lock(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE) };
             options.push(ZDBIndexOptions::from_relation(&index));
         }
-        Ok(Some(()))
-    });
-
-    options
+        Ok::<_, spi::Error>(    options)
+    }).expect("SPI failed")
 }
 
 pub fn alter_indices(prev_options: Option<Vec<ZDBIndexOptions>>) {
     if let Some(prev_options) = prev_options {
         for (old_options, new_options, index) in prev_options.into_iter().map(|option| {
-            let index =
-                PgRelation::with_lock(option.oid(), pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let index = unsafe {
+                PgRelation::with_lock(option.oid(), pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+            };
             (option, ZDBIndexOptions::from_relation(&index), index)
         }) {
             if old_options.url() != new_options.url()

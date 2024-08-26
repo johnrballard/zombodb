@@ -3,10 +3,10 @@
 //!
 //! Returns documents that contain one or more exact terms in a provided field
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::*;
 
     #[pg_extern(name = "terms", immutable, parallel_safe)]
@@ -45,7 +45,10 @@ mod dsl {
     }
 
     #[inline]
-    fn make_terms_dsl<T: serde::Serialize + FromDatum>(field: &str, values: Array<T>) -> ZDBQuery {
+    fn make_terms_dsl<T: serde::Serialize + FromDatum>(
+        field: &str,
+        values: VariadicArray<T>,
+    ) -> ZDBQuery {
         ZDBQuery::new_with_query_dsl(json! {
             {
                 "terms": {
@@ -57,10 +60,10 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     // SELECT terms('fieldname', ARRAY[1,2,3]::integer[], 1.0);
@@ -70,7 +73,8 @@ mod tests {
         let result = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.terms('fieldname', 'one'::text, 'two', 'three', 'four');",
         )
-        .expect("didn't get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = result.into_value();
 
         assert_eq!(
@@ -90,7 +94,8 @@ mod tests {
     fn test_terms_bool() {
         let result =
             Spi::get_one::<ZDBQuery>("SELECT dsl.terms('fieldname', true::bool,false,true,true);")
-                .expect("didn't get SPI result");
+                .expect("SPI failed")
+                .expect("SPI datum was NULL");
         let dsl = result.into_value();
 
         assert_eq!(
@@ -116,7 +121,8 @@ mod tests {
             "SELECT dsl.terms('fieldname','{}'::smallint, {}, {});",
             min, zero, max
         ))
-        .expect("didn't get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = result.into_value();
 
         assert_eq!(
@@ -142,7 +148,8 @@ mod tests {
             "SELECT dsl.terms('fieldname', '{}'::integer, {}, {});",
             min, zero, max
         ))
-        .expect("didn't get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = result.into_value();
 
         assert_eq!(
@@ -168,7 +175,8 @@ mod tests {
             "SELECT dsl.terms('fieldname', '{}'::bigint, {}, {});",
             min, zero, max
         ))
-        .expect("didn't get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = result.into_value();
 
         assert_eq!(
@@ -196,7 +204,8 @@ mod tests {
             "SELECT dsl.terms('fieldname', '{}'::real, {}, {}, {},'{}');",
             ninf, min, zero, max, inf
         ))
-        .expect("didn't get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = result.into_value();
 
         assert_eq!(
@@ -224,7 +233,8 @@ mod tests {
             "SELECT dsl.terms('fieldname', '{}'::double precision, {}, {},{},'{}');",
             ninf, min, zero, max, inf
         ))
-        .expect("didn't get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = result.into_value();
 
         assert_eq!(

@@ -1,7 +1,8 @@
 use crate::elasticsearch::Elasticsearch;
 use crate::utils::json_to_string;
 use crate::zdbquery::ZDBQuery;
-use pgx::*;
+use pgrx::prelude::*;
+use pgrx::*;
 use serde::*;
 use serde_json::*;
 
@@ -11,16 +12,14 @@ fn date_range(
     field: &str,
     query: ZDBQuery,
     date_range_array: Json,
-) -> impl std::iter::Iterator<
-    Item = (
-        name!(key, String),
-        name!(from, Option<Numeric>),
-        name!(from_as_string, Option<String>),
-        name!(to, Option<Numeric>),
-        name!(to_as_string, Option<String>),
-        name!(doc_count, i64),
-    ),
-> {
+) -> TableIterator<(
+    name!(key, String),
+    name!(from, Option<AnyNumeric>),
+    name!(from_as_string, Option<String>),
+    name!(to, Option<AnyNumeric>),
+    name!(to_as_string, Option<String>),
+    name!(doc_count, i64),
+)> {
     #[derive(Deserialize, Serialize)]
     struct DateRangesAggData {
         buckets: Vec<BucketEntry>,
@@ -29,9 +28,9 @@ fn date_range(
     #[derive(Deserialize, Serialize)]
     struct BucketEntry {
         key: serde_json::Value,
-        from: Option<Numeric>,
+        from: Option<AnyNumeric>,
         from_as_string: Option<String>,
-        to: Option<Numeric>,
+        to: Option<AnyNumeric>,
         to_as_string: Option<String>,
         doc_count: i64,
     }
@@ -56,7 +55,7 @@ fn date_range(
         .execute()
         .expect("failed to execute aggregate search");
 
-    result.buckets.into_iter().map(|entry| {
+    TableIterator::new(result.buckets.into_iter().map(|entry| {
         (
             json_to_string(entry.key).unwrap(),
             entry.from,
@@ -65,5 +64,5 @@ fn date_range(
             entry.to_as_string,
             entry.doc_count,
         )
-    })
+    }))
 }

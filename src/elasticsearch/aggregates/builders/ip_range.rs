@@ -3,7 +3,7 @@
 //!
 //! Returns JsonB that is a Filer ES Query
 
-use pgx::*;
+use pgrx::*;
 use serde::*;
 use serde_json::*;
 
@@ -20,7 +20,7 @@ fn ip_range_agg(
     aggregate_name: &str,
     field: &str,
     range: Vec<Json>,
-    keyed: Option<default!(bool, NULL)>,
+    keyed: default!(Option<bool>, NULL),
 ) -> JsonB {
     let ip_range = IPRange {
         field,

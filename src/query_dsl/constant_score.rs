@@ -1,7 +1,7 @@
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::zdbquery::{ZDBQuery, ZDBQueryClause};
-    use pgx::*;
+    use pgrx::*;
 
     #[pg_extern(immutable, parallel_safe)]
     pub fn constant_score(boost: f32, query: ZDBQuery) -> ZDBQuery {
@@ -13,7 +13,7 @@ mod dsl {
     pub fn boosting(
         positive_query: ZDBQuery,
         negative_query: ZDBQuery,
-        negative_boost: Option<default!(f32, NULL)>,
+        negative_boost: default!(Option<f32>, NULL),
     ) -> ZDBQuery {
         ZDBQuery::new_with_query_clause(ZDBQueryClause::boosting(
             positive_query.query_dsl(),
@@ -25,8 +25,8 @@ mod dsl {
     #[pg_extern(immutable, parallel_safe)]
     pub fn dis_max(
         queries: Array<ZDBQuery>,
-        boost: Option<default!(f32, NULL)>,
-        tie_breaker: Option<default!(f32, NULL)>,
+        boost: default!(Option<f32>, NULL),
+        tie_breaker: default!(Option<f32>, NULL),
     ) -> ZDBQuery {
         let queries = queries
             .iter()
@@ -41,11 +41,11 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::query_dsl::constant_score::dsl::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::*;
 
     #[pg_test]
@@ -104,7 +104,8 @@ mod tests {
             '5.5'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(

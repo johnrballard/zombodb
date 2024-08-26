@@ -1,5 +1,5 @@
 #
-# Copyright 2018-2022 ZomboDB, LLC
+# Copyright 2018-2023 ZomboDB, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,22 +26,19 @@ RUN useradd -m ${USER} --uid=${UID}
 
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update -y -qq --fix-missing
-RUN apt-get install -y wget gnupg
+RUN apt-get update && apt-get install -y wget gnupg
 RUN echo "deb http://apt.postgresql.org/pub/repos/apt/ bullseye-pgdg main" >> /etc/apt/sources.list.d/pgdg.list
 RUN wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
-RUN apt update
-RUN apt-get update -y --fix-missing
-RUN apt-get install -y curl
 
-RUN apt-get install -y git
-RUN apt-get install -y gcc make build-essential libz-dev zlib1g-dev strace libssl-dev pkg-config
-RUN apt-get install -y postgresql-10 postgresql-server-dev-10
-RUN apt-get install -y postgresql-11 postgresql-server-dev-11
-RUN apt-get install -y postgresql-12 postgresql-server-dev-12
-RUN apt-get install -y postgresql-13 postgresql-server-dev-13
-RUN apt-get install -y postgresql-14 postgresql-server-dev-14
-RUN apt-get install -y ruby ruby-dev rubygems build-essential
+RUN apt-get update && apt-get install -y git curl
+RUN apt-get update && apt-get install -y gcc make build-essential libz-dev zlib1g-dev strace libssl-dev pkg-config
+
+RUN apt-get update && apt-get install -y postgresql-12 postgresql-server-dev-12
+RUN apt-get update && apt-get install -y postgresql-13 postgresql-server-dev-13
+RUN apt-get update && apt-get install -y postgresql-14 postgresql-server-dev-14
+RUN apt-get update && apt-get install -y postgresql-15 postgresql-server-dev-15
+RUN apt-get update && apt-get install -y ruby ruby-dev rubygems build-essential
+RUN gem install dotenv -v 2.8.1
 RUN gem install --no-document fpm
 
 
@@ -50,10 +47,9 @@ WORKDIR /home/${USER}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
 ENV PATH="/home/${USER}/.cargo/bin:${PATH}"
 
-RUN cargo install cargo-pgx
-RUN cargo pgx init \
-	--pg10=/usr/lib/postgresql/10/bin/pg_config \
-	--pg11=/usr/lib/postgresql/11/bin/pg_config \
+RUN cargo install cargo-pgrx
+RUN cargo pgrx init \
 	--pg12=/usr/lib/postgresql/12/bin/pg_config \
 	--pg13=/usr/lib/postgresql/13/bin/pg_config \
-	--pg14=/usr/lib/postgresql/14/bin/pg_config
+	--pg14=/usr/lib/postgresql/14/bin/pg_config \
+	--pg15=/usr/lib/postgresql/15/bin/pg_config

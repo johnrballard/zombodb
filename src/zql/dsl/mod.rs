@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 
-use pgx::*;
+use pgrx::prelude::*;
+use pgrx::*;
 use serde_json::json;
 
 use crate::access_method::options::ZDBIndexOptions;
 use crate::elasticsearch::aggregates::terms::terms_array_agg;
 use crate::gucs::{ZDB_ACCELERATOR, ZDB_IGNORE_VISIBILITY};
-use crate::utils::lookup_es_field_type;
+use crate::utils::{is_keyword_field, lookup_es_field_type};
 use crate::zdbquery::mvcc::build_visibility_clause;
 use crate::zdbquery::ZDBQuery;
 use crate::zql::ast::{
@@ -23,11 +24,11 @@ fn dump_query(index: PgRelation, query: ZDBQuery) -> String {
 fn debug_query(
     index: PgRelation,
     query: &str,
-) -> (
+) -> TableIterator<(
     name!(normalized_query, String),
     name!(used_fields, Vec<String>),
     name!(ast, String),
-) {
+)> {
     let mut used_fields = HashSet::new();
     let query = Expr::from_str(
         &index,
@@ -41,15 +42,18 @@ fn debug_query(
 
     let tree = format!("{:#?}", query);
 
-    (
-        sqlformat::format(
-            &format!("{}", query),
-            &sqlformat::QueryParams::default(),
-            sqlformat::FormatOptions::default(),
-        )
-        .replace(" :\"", ":\""),
-        used_fields.into_iter().map(|v| v.into()).collect(),
-        format!("{}", tree),
+    TableIterator::new(
+        vec![(
+            sqlformat::format(
+                &format!("{}", query),
+                &sqlformat::QueryParams::default(),
+                sqlformat::FormatOptions::default(),
+            )
+            .replace(" :\"", ":\""),
+            used_fields.into_iter().map(|v| v.into()).collect(),
+            format!("{}", tree),
+        )]
+        .into_iter(),
     )
 }
 
@@ -255,6 +259,11 @@ fn eq(field: &QualifiedField, term: &Term, is_span: bool) -> serde_json::Value {
                 json! { { "exists": { "field": field.field_name() } } }
             }
         }
+
+        Term::MatchNone => {
+            json! { { "match_none": {} } }
+        }
+
         Term::String(s, b) => {
             if s.contains('\\') {
                 let s = unescape(s);
@@ -271,10 +280,19 @@ fn eq(field: &QualifiedField, term: &Term, is_span: bool) -> serde_json::Value {
                 }
             }
         }
-        Term::PhraseWithWildcard(s, b) => match ProximityTerm::make_proximity_chain(field, s, *b) {
-            ProximityTerm::ProximityChain(v) => proximity_chain(field, &v),
-            other => eq(field, &other.to_term(), true),
-        },
+        Term::PhraseWithWildcard(s, b) => {
+            if let Some(index) = field.index.as_ref() {
+                let indexrel = index.open_index().unwrap();
+                if is_keyword_field(&indexrel, &field.field_name()) {
+                    let wildcard = Term::Wildcard(s, *b);
+                    return eq(field, &wildcard, is_span);
+                }
+            }
+            match ProximityTerm::make_proximity_chain(field, s, *b) {
+                ProximityTerm::ProximityChain(v) => proximity_chain(field, &v),
+                other => eq(field, &other.to_term(), true),
+            }
+        }
 
         Term::Phrase(s, b) => {
             if is_span {
@@ -316,9 +334,9 @@ fn eq(field: &QualifiedField, term: &Term, is_span: bool) -> serde_json::Value {
             } else {
                 if s.contains('\\') {
                     let s = unescape(s);
-                    json! { { "match_phrase_prefix": { field.field_name(): { "query": s[..s.len()-1], "boost": b.unwrap_or(1.0) } } } }
+                    json! { { "match_phrase_prefix": { field.field_name(): { "query": s[..s.len()-1], "boost": b.unwrap_or(1.0), "max_expansions": 2147483647 } } } }
                 } else {
-                    json! { { "match_phrase_prefix": { field.field_name(): { "query": s[..s.len()-1], "boost": b.unwrap_or(1.0) } } } }
+                    json! { { "match_phrase_prefix": { field.field_name(): { "query": s[..s.len()-1], "boost": b.unwrap_or(1.0), "max_expansions": 2147483647 } } } }
                 }
             }
         }
@@ -351,7 +369,10 @@ fn eq(field: &QualifiedField, term: &Term, is_span: bool) -> serde_json::Value {
                 }
             }
 
-            if clauses.len() == 1 {
+            if clauses.is_empty() {
+                // this shouldn't happen as a `field:[]` gets rewritten to Term::MatchNone during parsing
+                json! { { "terms": { field.field_name(): [] } } }
+            } else if clauses.len() == 1 {
                 clauses.pop().unwrap()
             } else {
                 json! { { "bool": { "should": clauses } } }
@@ -382,7 +403,7 @@ fn proximity_chain(field: &QualifiedField, parts: &Vec<ProximityPart>) -> serde_
         if part.words.len() == 1 {
             clauses.push((
                 eq(field, &part.words.get(0).unwrap().to_term(), true),
-                &part.distance,
+                part.distance,
             ));
         } else {
             let mut spans = Vec::new();
@@ -394,30 +415,33 @@ fn proximity_chain(field: &QualifiedField, parts: &Vec<ProximityPart>) -> serde_
                 json! {
                     { "span_or": { "clauses": spans } }
                 },
-                &part.distance,
+                part.distance,
             ));
         }
     }
 
-    let mut span_near = None;
-    let mut clauses = clauses.into_iter();
-    while let Some((clause, distance)) = clauses.next() {
-        let distance = distance.unwrap_or_default();
-        let span = if let Some((next_clause, _)) = clauses.next() {
-            json! {
-                { "span_near": { "clauses": [ clause, next_clause ], "slop": distance.distance, "in_order": distance.in_order } }
-            }
-        } else {
-            clause
-        };
+    if clauses.len() == 1 {
+        return clauses.pop().unwrap().0;
+    }
 
-        span_near = Some(if span_near.is_none() {
-            span
-        } else {
-            json! {
-                { "span_near": { "clauses": [ span_near, span ], "slop": distance.distance, "in_order": distance.in_order } }
-            }
+    let mut clauses = clauses.into_iter();
+
+    let (first, distance) = clauses.next().unwrap();
+    let (second, next_distance) = clauses.next().unwrap();
+
+    let distance = distance.unwrap();
+    let mut span_near = Some(json! {
+        { "span_near": { "clauses": [ first, second ], "slop": distance.distance, "in_order": distance.in_order } }
+    });
+
+    let mut prev_distance = next_distance;
+    while let Some((clause, distance)) = clauses.next() {
+        let d = prev_distance.unwrap();
+        span_near = Some(json! {
+            { "span_near": { "clauses": [ span_near.unwrap(), clause ], "slop": d.distance, "in_order": d.in_order } }
         });
+
+        prev_distance = distance;
     }
 
     span_near.expect("did not generate a span_near clause")

@@ -40,15 +40,15 @@ use crate::elasticsearch::search::ElasticsearchSearchRequest;
 use crate::elasticsearch::suggest_term::ElasticsearchSuggestTermRequest;
 use crate::elasticsearch::update_settings::ElasticsearchUpdateSettingsRequest;
 use crate::executor_manager::get_executor_manager;
+use crate::gucs::ZDB_LOG_LEVEL;
 use crate::utils::is_nested_field;
 use crate::zdbquery::ZDBPreparedQuery;
 pub use bulk::*;
 pub use create_index::*;
 use lazy_static::*;
-use pgx::*;
+use pgrx::*;
 use serde::de::DeserializeOwned;
-use serde_json::json;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::io::Read;
@@ -57,9 +57,9 @@ lazy_static! {
     static ref NUM_CPUS: usize = num_cpus::get();
 }
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 pub mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::Serialize;
 
     #[allow(non_camel_case_types)]
@@ -72,7 +72,7 @@ pub mod pg_catalog {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Elasticsearch {
     options: ZDBIndexOptions,
 }
@@ -133,7 +133,29 @@ impl Elasticsearch {
     pub fn client() -> &'static ureq::Agent {
         lazy_static::lazy_static! {
             static ref AGENT: ureq::Agent = {
-                ureq::AgentBuilder::new()
+                let agent_builder = ureq::AgentBuilder::new();
+
+                #[cfg(feature = "native_tls")] // if native_tls feature is enabled - we need to create TlsConnector and pass it to agent_builder
+                {
+                    match native_tls::TlsConnector::new() {
+                        Ok(tls_config) => {
+                            return agent_builder
+                            .tls_connector(std::sync::Arc::new(tls_config))
+                            .timeout_read(std::time::Duration::from_secs(3600))  // a 1hr timeout waiting on ES to return
+                            .max_idle_connections_per_host(num_cpus::get())     // 1 for each CPU -- only really used during _bulk
+                            .build();
+                        }
+                        Err(e) => {
+                            // log the error
+                            crate::gucs::ZDB_LOG_LEVEL.get().log(&format!(
+                                "[zombodb] can't create native tls connector - {}",
+                                e
+                            ));
+                        }
+                    }
+                }
+
+                agent_builder
                 .timeout_read(std::time::Duration::from_secs(3600))  // a 1hr timeout waiting on ES to return
                 .max_idle_connections_per_host(num_cpus::get())     // 1 for each CPU -- only really used during _bulk
                 .build()
@@ -186,14 +208,14 @@ impl Elasticsearch {
         ElasticsearchAnalyzerRequest::new_with_field(self, field, text)
     }
 
-    pub fn analyze_custom(
+    pub fn analyze_custom<'a>(
         &self,
-        field: Option<default!(&str, NULL)>,
-        text: Option<default!(&str, NULL)>,
-        tokenizer: Option<default!(&str, NULL)>,
-        normalizer: Option<default!(&str, NULL)>,
-        filter: Option<default!(Array<&str>, NULL)>,
-        char_filter: Option<default!(Array<&str>, NULL)>,
+        field: Option<default!(&'a str, NULL)>,
+        text: Option<default!(&'a str, NULL)>,
+        tokenizer: Option<default!(&'a str, NULL)>,
+        normalizer: Option<default!(&'a str, NULL)>,
+        filter: Option<default!(Array<'a, &'a str>, NULL)>,
+        char_filter: Option<default!(Array<'a, &'a str>, NULL)>,
     ) -> ElasticsearchAnalyzerRequest {
         ElasticsearchAnalyzerRequest::new_custom(
             self,
@@ -306,16 +328,18 @@ impl Elasticsearch {
             } else {
                 let field = field.as_ref().unwrap();
                 // maybe it is nested, so lets go look
-                let index = PgRelation::with_lock(
-                    self.options.oid(),
-                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-                );
+                let index = unsafe {
+                    PgRelation::with_lock(
+                        self.options.oid(),
+                        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                    )
+                };
 
                 // get the full path, which is the full field name minus the last dotted part
                 let mut path = field.rsplitn(2, '.').collect::<Vec<&str>>();
                 let path = path.pop().unwrap();
 
-                if is_nested_field(&index, &path) {
+                if is_nested_field(&index, &path).unwrap_or(false) {
                     // is nested, so we also need to generate a filter query for it
                     if need_filter {
                         let mut value = query.query_dsl().clone();
@@ -390,7 +414,7 @@ impl Elasticsearch {
         ElasticsearchGetSettingsRequest::new(self)
     }
 
-    pub fn url(&self) -> &str {
+    pub fn url(&self) -> String {
         self.options.url()
     }
 
@@ -410,7 +434,7 @@ impl Elasticsearch {
         self.options.alias()
     }
 
-    pub fn type_name(&self) -> &str {
+    pub fn type_name(&self) -> String {
         self.options.type_name()
     }
 
@@ -434,8 +458,21 @@ impl Elasticsearch {
         F: FnOnce(&mut (dyn std::io::Read + Send)) -> std::result::Result<R, ElasticsearchError>,
     {
         let response = if post_data.is_some() {
-            request.send_json(post_data.unwrap())
+            let post_data = post_data.unwrap();
+
+            if ZDB_LOG_LEVEL.get().log_level() == PgLogLevel::DEBUG1 {
+                pgrx::debug1!(
+                    "{}\n{}",
+                    request.url(),
+                    serde_json::to_string_pretty(&post_data).unwrap()
+                );
+            }
+
+            request.send_json(post_data)
         } else {
+            if ZDB_LOG_LEVEL.get().log_level() == PgLogLevel::DEBUG1 {
+                pgrx::debug1!("{}", request.url());
+            }
             request.call()
         };
 
@@ -531,8 +568,8 @@ fn request(
     index: PgRelation,
     endpoint: &str,
     method: default!(ArbitraryRequestType, "'GET'"),
-    post_data: Option<default!(JsonB, NULL)>,
-    null_on_error: Option<default!(bool, false)>,
+    post_data: default!(Option<JsonB>, NULL),
+    null_on_error: default!(Option<bool>, false),
 ) -> Option<String> {
     let es = Elasticsearch::new(&index);
     match es.arbitrary_request(method, endpoint, post_data.map_or(None, |v| Some(v.0))) {

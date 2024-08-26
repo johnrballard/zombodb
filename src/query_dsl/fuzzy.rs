@@ -1,7 +1,7 @@
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -24,11 +24,11 @@ mod dsl {
     pub fn fuzzy(
         field: &str,
         value: &str,
-        boost: Option<default!(f32, NULL)>,
-        fuzziness: Option<default!(i32, NULL)>,
-        prefix_length: Option<default!(i64, NULL)>,
-        max_expansions: Option<default!(i64, 50)>,
-        transpositions: Option<default!(bool, NULL)>,
+        boost: default!(Option<f32>, NULL),
+        fuzziness: default!(Option<i32>, NULL),
+        prefix_length: default!(Option<i64>, NULL),
+        max_expansions: default!(Option<i64>, 50),
+        transpositions: default!(Option<bool>, NULL),
     ) -> ZDBQuery {
         let fuzzy_object = Fuzzy {
             value,
@@ -50,10 +50,10 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::query_dsl::fuzzy::dsl::*;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     #[pg_test]

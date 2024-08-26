@@ -1,9 +1,9 @@
-use pgx::*;
+use pgrx::*;
 use serde_json::json;
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::Serialize;
 
     #[derive(PostgresEnum, Serialize)]
@@ -34,12 +34,18 @@ fn point_array_to_json(points: Array<pg_sys::Point>) -> Json {
     )
 }
 
-#[pgx_macros::pg_schema]
+fn variadic_point_array_to_json(points: VariadicArray<pg_sys::Point>) -> Json {
+    Json(
+        json! { points.into_iter().map(|v| point_to_json(v.expect("null points are not allowed"))).collect::<Vec<Json>>() },
+    )
+}
+
+#[pgrx::pg_schema]
 mod dsl {
     use crate::query_dsl::geo::pg_catalog::{GeoBoundingBoxType, GeoShapeRelation};
-    use crate::query_dsl::geo::point_array_to_json;
+    use crate::query_dsl::geo::variadic_point_array_to_json;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     #[pg_extern(immutable, parallel_safe)]
@@ -81,8 +87,8 @@ mod dsl {
     }
 
     #[pg_extern(immutable, parallel_safe)]
-    fn geo_polygon(field: &str, points: variadic!(Array<pg_sys::Point>)) -> ZDBQuery {
-        let points_json = point_array_to_json(points);
+    fn geo_polygon(field: &str, points: VariadicArray<pg_sys::Point>) -> ZDBQuery {
+        let points_json = variadic_point_array_to_json(points);
         ZDBQuery::new_with_query_dsl(json! {
             {
                 "geo_polygon": {

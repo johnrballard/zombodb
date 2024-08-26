@@ -1,5 +1,6 @@
 use crate::elasticsearch::{Elasticsearch, ElasticsearchError};
-use pgx::*;
+use pgrx::prelude::*;
+use pgrx::*;
 use serde::*;
 use serde_json::*;
 
@@ -90,14 +91,14 @@ impl ElasticsearchAnalyzerRequest {
         }
     }
 
-    pub fn new_custom(
+    pub fn new_custom<'a>(
         elasticsearch: &Elasticsearch,
-        field: Option<&str>,
-        text: Option<&str>,
-        tokenizer: Option<&str>,
-        normalizer: Option<&str>,
-        filter: Option<Array<&str>>,
-        char_filter: Option<Array<&str>>,
+        field: Option<&'a str>,
+        text: Option<&'a str>,
+        tokenizer: Option<&'a str>,
+        normalizer: Option<&'a str>,
+        filter: Option<Array<'a, &'a str>>,
+        char_filter: Option<Array<'a, &'a str>>,
     ) -> ElasticsearchAnalyzerRequest {
         let custom = Custom {
             field,
@@ -120,8 +121,9 @@ fn analyze_text(
     index: PgRelation,
     analyzer: &str,
     text: &str,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(type, String),
         name!(token, String),
         name!(position, i32),
@@ -139,8 +141,9 @@ pub(crate) fn analyze_with_field(
     index: PgRelation,
     field: &str,
     text: &str,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(type, String),
         name!(token, String),
         name!(position, i32),
@@ -154,16 +157,17 @@ pub(crate) fn analyze_with_field(
 }
 
 #[pg_extern(immutable, parallel_safe)]
-fn analyze_custom(
+fn analyze_custom<'a>(
     index: PgRelation,
-    field: Option<default!(&str, NULL)>,
-    text: Option<default!(&str, NULL)>,
-    tokenizer: Option<default!(&str, NULL)>,
-    normalizer: Option<default!(&str, NULL)>,
-    filter: Option<default!(Array<&str>, NULL)>,
-    char_filter: Option<default!(Array<&str>, NULL)>,
-) -> impl std::iter::Iterator<
-    Item = (
+    field: default!(Option<&'a str>, NULL),
+    text: default!(Option<&'a str>, NULL),
+    tokenizer: default!(Option<&'a str>, NULL),
+    normalizer: default!(Option<&'a str>, NULL),
+    filter: default!(Option<Array<'a, &'a str>>, NULL),
+    char_filter: default!(Option<Array<'a, &'a str>>, NULL),
+) -> TableIterator<
+    'static,
+    (
         name!(type, String),
         name!(token, String),
         name!(position, i32),
@@ -185,8 +189,9 @@ fn analyze_custom(
 
 fn elasticsearch_request_return(
     request: ElasticsearchAnalyzerRequest,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(type, String),
         name!(token, String),
         name!(position, i32),
@@ -194,38 +199,41 @@ fn elasticsearch_request_return(
         name!(end_offset, i64),
     ),
 > {
-    request
-        .execute()
-        .expect("failed to execute Analyze search")
-        .tokens
-        .into_iter()
-        .map(|entry| {
-            (
-                entry.type_,
-                entry.token,
-                entry.position,
-                entry.start_offset,
-                entry.end_offset,
-            )
-        })
+    TableIterator::new(
+        request
+            .execute()
+            .expect("failed to execute Analyze search")
+            .tokens
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.type_,
+                    entry.token,
+                    entry.position,
+                    entry.start_offset,
+                    entry.end_offset,
+                )
+            }),
+    )
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
-    use pgx::*;
+    use pgrx::spi::SpiTupleTable;
+    use pgrx::*;
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_analyze_text() {
-        Spi::run("CREATE TABLE test_analyze_text AS SELECT * FROM generate_series(1, 100);");
-        Spi::run("CREATE INDEX idxtest_analyze_text ON test_analyze_text USING zombodb ((test_analyze_text.*));");
+    fn test_analyze_text() -> spi::Result<()> {
+        Spi::run("CREATE TABLE test_analyze_text AS SELECT * FROM generate_series(1, 100);")?;
+        Spi::run("CREATE INDEX idxtest_analyze_text ON test_analyze_text USING zombodb ((test_analyze_text.*));")?;
         Spi::connect(|client| {
             let table = client.select(
                 " SELECT * FROM zdb.analyze_text('idxtest_analyze_text', 'standard', 'this is a test');",
                 None,
                 None,
-            );
+            )?;
 
             //    type        | token | position | start_offset | end_offset
             //    ------------+-------+----------+--------------+------------
@@ -242,21 +250,21 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_analyze_with_field() {
-        Spi::run("CREATE TABLE test_analyze_with_field AS SELECT * FROM generate_series(1, 100);");
-        Spi::run("CREATE INDEX idxtest_analyze_with_field ON test_analyze_with_field USING zombodb ((test_analyze_with_field.*));");
+    fn test_analyze_with_field() -> spi::Result<()> {
+        Spi::run("CREATE TABLE test_analyze_with_field AS SELECT * FROM generate_series(1, 100);")?;
+        Spi::run("CREATE INDEX idxtest_analyze_with_field ON test_analyze_with_field USING zombodb ((test_analyze_with_field.*));")?;
         Spi::connect(|client| {
             let table = client.select(
                 " SELECT * FROM zdb.analyze_with_field('idxtest_analyze_with_field', 'column', 'this is a test');",
                 None,
                 None,
-            );
+            )?;
 
             //    type        | token | position | start_offset | end_offset
             //    ------------+-------+----------+--------------+------------
@@ -273,21 +281,21 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_analyze_custom() {
-        Spi::run("CREATE TABLE test_analyze_custom AS SELECT * FROM generate_series(1, 100);");
-        Spi::run("CREATE INDEX idxtest_analyze_custom ON test_analyze_custom USING zombodb ((test_analyze_custom.*));");
+    fn test_analyze_custom() -> spi::Result<()> {
+        Spi::run("CREATE TABLE test_analyze_custom AS SELECT * FROM generate_series(1, 100);")?;
+        Spi::run("CREATE INDEX idxtest_analyze_custom ON test_analyze_custom USING zombodb ((test_analyze_custom.*));")?;
         Spi::connect(|client| {
             let table = client.select(
                 " SELECT * FROM zdb.analyze_custom(index=>'idxtest_analyze_custom',text=> 'this is a test', tokenizer =>'standard');",
                 None,
                 None,
-            );
+            )?;
 
             //    type        | token | position | start_offset | end_offset
             //    ------------+-------+----------+--------------+------------
@@ -304,18 +312,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     fn test_table(mut table: SpiTupleTable, expect: Vec<(&str, &str, i32, i64, i64)>) {
         let mut i = 0;
         while let Some(_) = table.next() {
-            let ttype = table.get_datum::<&str>(1).unwrap();
-            let token = table.get_datum::<&str>(2).unwrap();
-            let pos = table.get_datum::<i32>(3).unwrap();
-            let start_offset = table.get_datum::<i64>(4).unwrap();
-            let end_offset = table.get_datum::<i64>(5).unwrap();
+            let ttype = table.get::<&str>(1).expect("SPI failed").unwrap();
+            let token = table.get::<&str>(2).expect("SPI failed").unwrap();
+            let pos = table.get::<i32>(3).expect("SPI failed").unwrap();
+            let start_offset = table.get::<i64>(4).expect("SPI failed").unwrap();
+            let end_offset = table.get::<i64>(5).expect("SPI failed").unwrap();
 
             let row_tuple = (ttype, token, pos, start_offset, end_offset);
 

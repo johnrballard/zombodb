@@ -1,6 +1,7 @@
 use crate::elasticsearch::Elasticsearch;
 use crate::zdbquery::ZDBQuery;
-use pgx::*;
+use pgrx::prelude::*;
+use pgrx::*;
 use serde::*;
 use serde_json::*;
 
@@ -9,14 +10,15 @@ fn matrix_stats(
     index: PgRelation,
     fields: Array<&str>,
     query: ZDBQuery,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(term, String),
         name!(count, i64),
-        name!(mean, Numeric),
-        name!(variance, Numeric),
-        name!(skewness, Numeric),
-        name!(kurtosis, Numeric),
+        name!(mean, AnyNumeric),
+        name!(variance, AnyNumeric),
+        name!(skewness, AnyNumeric),
+        name!(kurtosis, AnyNumeric),
         name!(covariance, Option<Json>),
         name!(correlation, Option<Json>),
     ),
@@ -31,10 +33,10 @@ fn matrix_stats(
     struct Fields {
         name: String,
         count: i64,
-        mean: Numeric,
-        variance: Numeric,
-        skewness: Numeric,
-        kurtosis: Numeric,
+        mean: AnyNumeric,
+        variance: AnyNumeric,
+        skewness: AnyNumeric,
+        kurtosis: AnyNumeric,
         covariance: serde_json::Value,
         correlation: serde_json::Value,
     }
@@ -58,7 +60,7 @@ fn matrix_stats(
         .execute()
         .expect("failed to execute aggregate search");
 
-    result.fields.unwrap_or_default().into_iter().map(|entry| {
+    TableIterator::new(result.fields.unwrap_or_default().into_iter().map(|entry| {
         (
             entry.name,
             entry.count,
@@ -69,5 +71,5 @@ fn matrix_stats(
             Some(Json(entry.covariance)),
             Some(Json(entry.correlation)),
         )
-    })
+    }))
 }

@@ -1,18 +1,18 @@
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod pg_catalog {
     use crate::zdbquery::ZDBQueryClause;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
 
     #[derive(Debug, PostgresType, Serialize, Deserialize)]
     pub struct BoolQueryPart(pub ZDBQueryClause);
 }
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 pub mod dsl {
     use super::pg_catalog::*;
     use crate::zdbquery::{ZDBQuery, ZDBQueryClause};
-    use pgx::*;
+    use pgrx::*;
 
     #[pg_extern(immutable, parallel_safe)]
     fn bool(parts: VariadicArray<BoolQueryPart>) -> ZDBQuery {
@@ -130,10 +130,27 @@ pub mod dsl {
         )))
     }
 
-    // NB: we use the `variadic!()` macro here so that we can call this function
-    // from other rust code with a Vec<Option<ZDBQuery>>
     #[pg_extern(immutable, parallel_safe)]
-    pub fn and(queries: variadic!(Vec<Option<ZDBQuery>>)) -> ZDBQuery {
+    pub fn and(queries: VariadicArray<ZDBQuery>) -> ZDBQuery {
+        ZDBQuery::new_with_query_clause(ZDBQueryClause::bool(
+            Some(
+                queries
+                    .into_iter()
+                    .map(|zdbquery| {
+                        zdbquery
+                            .expect("found NULL zdbquery in clauses")
+                            .query_dsl()
+                    })
+                    .collect(),
+            ),
+            None,
+            None,
+            None,
+        ))
+    }
+
+    // A version of "and" that accepts a Vec, not meant for external usage
+    pub(crate) fn and_vec(queries: Vec<Option<ZDBQuery>>) -> ZDBQuery {
         ZDBQuery::new_with_query_clause(ZDBQueryClause::bool(
             Some(
                 queries
@@ -201,18 +218,18 @@ pub mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::query_dsl::bool::dsl::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     #[pg_test]
     fn test_bool_all_part_types() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.bool(dsl.must('q1', 'q2', 'q3'),dsl.must_not('q4','q5'),dsl.should('q6','q7'),dsl.filter('q8','q9'))")
-            .expect("failed to get SPI result");
+            .expect("SPI failed").expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -283,7 +300,7 @@ mod tests {
     fn test_bool_without_filter() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.bool(dsl.must('q1', 'q2', 'q3'),dsl.must_not('q4','q5'),dsl.should('q6','q7'))")
-            .expect("failed to get SPI result");
+            .expect("SPI failed").expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -342,7 +359,7 @@ mod tests {
     fn test_bool_with_must_twice() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.bool(dsl.must('q1', 'q2'),dsl.must_not('q4','q5'),dsl.should('q6','q7'),dsl.must('q3'))")
-            .expect("failed to get SPI result");
+            .expect("SPI failed").expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -400,7 +417,8 @@ mod tests {
     #[pg_test]
     fn test_and() {
         let zdbquery = Spi::get_one::<ZDBQuery>("SELECT dsl.and('q1', 'q2')")
-            .expect("failed to get SPI result");
+            .expect("SPI failed")
+            .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -429,7 +447,8 @@ mod tests {
     #[pg_test]
     fn test_or() {
         let zdbquery = Spi::get_one::<ZDBQuery>("SELECT dsl.or('q1', 'q2')")
-            .expect("failed to get SPI result");
+            .expect("SPI failed")
+            .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -458,7 +477,8 @@ mod tests {
     #[pg_test]
     fn test_not() {
         let zdbquery = Spi::get_one::<ZDBQuery>("SELECT dsl.not('q1', 'q2')")
-            .expect("failed to get SPI result");
+            .expect("SPI failed")
+            .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -487,7 +507,8 @@ mod tests {
     #[pg_test]
     fn test_binary_and() {
         let zdbquery = Spi::get_one::<ZDBQuery>("SELECT dsl.binary_and(dsl.limit(10, 'a'), 'b');")
-            .expect("failed to get SPI result");
+            .expect("SPI failed")
+            .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(

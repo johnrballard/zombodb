@@ -4,7 +4,7 @@
 //! Returns JsonB that is a Histogram ES Query
 
 use crate::elasticsearch::aggregates::builders::make_children_map;
-use pgx::*;
+use pgrx::*;
 use serde::*;
 use serde_json::*;
 
@@ -25,10 +25,10 @@ fn histogram_agg(
     aggregate_name: &str,
     field: &str,
     interval: i64,
-    min_count: Option<default!(i64, NULL)>,
-    keyed: Option<default!(bool, NULL)>,
-    missing: Option<default!(i64, NULL)>,
-    children: Option<default!(Vec<JsonB>, NULL)>,
+    min_count: default!(Option<i64>, NULL),
+    keyed: default!(Option<bool>, NULL),
+    missing: default!(Option<i64>, NULL),
+    children: default!(Option<Vec<JsonB>>, NULL),
 ) -> JsonB {
     let histogram = Histogram {
         field,

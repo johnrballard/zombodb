@@ -1,6 +1,8 @@
 use crate::elasticsearch::Elasticsearch;
 use crate::zdbquery::ZDBQuery;
-use pgx::*;
+use pgrx::*;
+
+pub mod timestamp_support;
 
 #[pg_extern(immutable, parallel_safe)]
 fn query_tids(index: PgRelation, query: ZDBQuery) -> Vec<pg_sys::ItemPointerData> {

@@ -2,10 +2,9 @@ use crate::elasticsearch::search::SearchResponseIntoIter;
 use crate::elasticsearch::Elasticsearch;
 use crate::executor_manager::get_executor_manager;
 use crate::zdbquery::ZDBQuery;
-use pgx::*;
+use pgrx::*;
 
 struct ZDBScanState {
-    zdbregtype: pg_sys::Oid,
     index_oid: pg_sys::Oid,
     iterator: *mut SearchResponseIntoIter,
 }
@@ -24,13 +23,6 @@ pub extern "C" fn ambeginscan(
         ))
     };
     let state = ZDBScanState {
-        zdbregtype: unsafe {
-            direct_function_call::<pg_sys::Oid>(
-                pg_sys::to_regtype,
-                vec!["pg_catalog.zdbquery".into_datum()],
-            )
-            .expect("failed to lookup type oid for pg_catalog.zdbquery")
-        },
         index_oid: unsafe { (*index_relation).rd_id },
         iterator: std::ptr::null_mut(),
     };
@@ -55,17 +47,15 @@ pub extern "C" fn amrescan(
     let scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
     let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
 
-    let mut state =
-        unsafe { (scan.opaque as *mut ZDBScanState).as_mut() }.expect("no scandesc state");
+    let state = unsafe { (scan.opaque as *mut ZDBScanState).as_mut() }.expect("no scandesc state");
     let nkeys = nkeys as usize;
     let keys = unsafe { std::slice::from_raw_parts(keys as *const pg_sys::ScanKeyData, nkeys) };
-    let mut query =
-        unsafe { ZDBQuery::from_datum(keys[0].sk_argument, false, state.zdbregtype).unwrap() };
+    let mut query = unsafe { ZDBQuery::from_datum(keys[0].sk_argument, false).unwrap() };
 
     // AND multiple keys together as a "bool": {"must":[....]} query
     for key in keys[1..nkeys].iter() {
         query = crate::query_dsl::bool::dsl::binary_and(query, unsafe {
-            ZDBQuery::from_datum(key.sk_argument, false, state.zdbregtype).unwrap()
+            ZDBQuery::from_datum(key.sk_argument, false).unwrap()
         });
     }
 
@@ -94,9 +84,6 @@ pub extern "C" fn amgettuple(
     let iter = unsafe { state.iterator.as_mut() }.expect("no iterator in state");
     match iter.next() {
         Some((score, ctid, _, highlights)) => {
-            #[cfg(any(feature = "pg10", feature = "pg11"))]
-            let tid = &mut scan.xs_ctup.t_self;
-            #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
             let tid = &mut scan.xs_heaptid;
 
             u64_to_item_pointer(ctid, tid);

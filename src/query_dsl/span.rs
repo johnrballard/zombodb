@@ -3,10 +3,10 @@
 //!
 //!Span queries are low-level positional queries which provide expert control over the order and proximity of the specified terms
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -94,9 +94,9 @@ mod dsl {
     pub(crate) fn span_not(
         include: ZDBQuery,
         exclude: ZDBQuery,
-        pre_integer: Option<default!(i64, NULL)>,
-        post_integer: Option<default!(i64, NULL)>,
-        dis_integer: Option<default!(i64, NULL)>,
+        pre_integer: default!(Option<i64>, NULL),
+        post_integer: default!(Option<i64>, NULL),
+        dis_integer: default!(Option<i64>, NULL),
     ) -> ZDBQuery {
         let include = include.into_value();
         let exclude = exclude.into_value();
@@ -145,7 +145,7 @@ mod dsl {
     pub(crate) fn span_term(
         field: &str,
         value: &str,
-        boost: Option<default!(f32, NULL)>,
+        boost: default!(Option<f32>, NULL),
     ) -> ZDBQuery {
         let span_terms = SpanTerm { value, boost };
         ZDBQuery::new_with_query_dsl(json! {
@@ -172,11 +172,11 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::query_dsl::span::dsl::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     #[pg_test]
@@ -326,14 +326,15 @@ mod tests {
     fn test_span_near_with_null() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.span_near(
-                true, 
-                50, 
-                dsl.term('field1', 'value1'), 
-                dsl.term('field2', 'value2'), 
+                true,
+                50,
+                dsl.term('field1', 'value1'),
+                dsl.term('field2', 'value2'),
                 null /* this causes the error */
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         zdbquery.limit(); //using this to prevent an warning that zdbquery is not used
     }
 
@@ -341,12 +342,13 @@ mod tests {
     fn test_span_near_with_null_inorder() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.span_near(
-                null, 
-                50, 
-                dsl.term('field1', 'value1'), 
+                null,
+                50,
+                dsl.term('field1', 'value1'),
                 dsl.term('field2', 'value2')
             )",
-        );
+        )
+        .expect("SPI failed");
 
         assert!(zdbquery.is_none());
     }
@@ -355,13 +357,14 @@ mod tests {
     fn test_span_near_without_nulls() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.span_near(
-                true, 
-                50, 
-                dsl.span_term('span_term_field1', 'span_term_value1'), 
+                true,
+                50,
+                dsl.span_term('span_term_field1', 'span_term_value1'),
                 dsl.span_term('span_term_field2', 'span_term_value2')
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -432,12 +435,13 @@ mod tests {
     fn test_span_or() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
             "SELECT dsl.span_or(
-                    dsl.span_term('span_term_field1', 'span_term_value1'), 
+                    dsl.span_term('span_term_field1', 'span_term_value1'),
                     dsl.span_term('span_term_field2', 'span_term_value2'),
                     dsl.span_term('span_term_field3', 'span_term_value3')
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(

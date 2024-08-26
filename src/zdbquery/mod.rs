@@ -1,4 +1,4 @@
-use pgx::*;
+use pgrx::*;
 use serde_json::{json, Value};
 
 mod cast;
@@ -98,18 +98,18 @@ impl PartialEq<Value> for ZDBQueryClause {
     fn eq(&self, other: &Value) -> bool {
         let value =
             serde_json::to_value(self).expect("failed to serialize ZDBQueryClause to Value");
-        pgx::log!("left ={}", serde_json::to_string(&value).unwrap());
-        pgx::log!("right={}", serde_json::to_string(other).unwrap());
+        pgrx::log!("left ={}", serde_json::to_string(&value).unwrap());
+        pgrx::log!("right={}", serde_json::to_string(other).unwrap());
         &value == other
     }
 }
 
 #[allow(non_camel_case_types)]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod pg_catalog {
     use crate::zdbquery::ZDBQueryClause;
     use crate::zql::ast::IndexLink;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -172,7 +172,7 @@ mod pg_catalog {
 }
 
 impl InOutFuncs for ZDBQuery {
-    fn input(input: &pgx::cstr_core::CStr) -> Self {
+    fn input(input: &std::ffi::CStr) -> Self {
         let input = input.to_str().expect("zdbquery input is not valid UTF8");
         ZDBQuery::from_str(input)
     }
@@ -407,6 +407,10 @@ impl ZDBQuery {
             .expect("ZDBQuery does not contain query dsl")
     }
 
+    pub fn query_string(&self) -> Option<String> {
+        Some(self.query_dsl.as_ref()?.zdb.as_ref()?.query.clone())
+    }
+
     /// Convert the this `ZDBQuery` into a `serde_json::Value` using the most minimal form we can
     pub fn into_value(self) -> serde_json::Value {
         self.as_value()
@@ -440,7 +444,10 @@ impl ZDBQuery {
                     &indexes,
                 );
                 let target_index = if let Some(target_link) = target_link.as_ref() {
-                    target_link.open_index().expect("failed to open index")
+                    target_link.open_index().expect(&format!(
+                        "ZQLQuery::prepare: failed to open index `{}`",
+                        target_link
+                    ))
                 } else {
                     index.clone()
                 };
@@ -897,15 +904,15 @@ fn to_queries_dsl(queries: Array<ZDBQuery>) -> Vec<Option<Json>> {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::*;
     use serde_json::json;
 
     #[pg_test]
     fn test_zdbquery_in_with_query_string() {
-        let input = pgx::cstr_core::CStr::from_bytes_with_nul(b"this is a test\0").unwrap();
-        let zdbquery = pg_catalog::zdbquery_in(input);
+        let input = std::ffi::CStr::from_bytes_with_nul(b"this is a test\0");
+        let zdbquery = pg_catalog::zdbquery_in(input.ok());
         let json = serde_json::to_value(&zdbquery).unwrap();
 
         assert_eq!(
@@ -916,8 +923,8 @@ mod tests {
 
     #[pg_test]
     fn test_zdbquery_in_with_query_dsl() {
-        let input = pgx::cstr_core::CStr::from_bytes_with_nul(b" {\"match_all\":{}} \0").unwrap();
-        let zdbquery = pg_catalog::zdbquery_in(input);
+        let input = std::ffi::CStr::from_bytes_with_nul(b" {\"match_all\":{}} \0");
+        let zdbquery = pg_catalog::zdbquery_in(input.ok());
         let json = serde_json::to_value(&zdbquery).unwrap();
 
         assert_eq!(json, json!( {"query_dsl":{"match_all":{}}} ));
@@ -925,11 +932,10 @@ mod tests {
 
     #[pg_test]
     fn test_zdbquery_in_with_full_query() {
-        let input = pgx::cstr_core::CStr::from_bytes_with_nul(
+        let input = std::ffi::CStr::from_bytes_with_nul(
             b" {\"query_dsl\":{\"query_string\":{\"query\":\"this is a test\"}}} \0",
-        )
-        .unwrap();
-        let zdbquery = pg_catalog::zdbquery_in(input);
+        );
+        let zdbquery = pg_catalog::zdbquery_in(input.ok());
         let json = serde_json::to_value(&zdbquery).unwrap();
 
         assert_eq!(

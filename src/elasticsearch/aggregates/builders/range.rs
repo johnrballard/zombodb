@@ -4,7 +4,7 @@
 //! Returns JsonB that is a Range ES Query
 
 use crate::elasticsearch::aggregates::builders::make_children_map;
-use pgx::*;
+use pgrx::*;
 use serde_json::*;
 
 // SELECT range_agg('name', 'field', ARRAY[ '{"to": 42}', '{"from":0, "to":99}', '{"from":0}'  ]::json[]);
@@ -13,7 +13,7 @@ fn range_agg(
     aggregate_name: &str,
     field: &str,
     ranges: Vec<Json>,
-    children: Option<default!(Vec<JsonB>, NULL)>,
+    children: default!(Option<Vec<JsonB>>, NULL),
 ) -> JsonB {
     JsonB(json! {
         {

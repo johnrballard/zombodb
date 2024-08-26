@@ -2,7 +2,12 @@
 
 # requires:  "cargo install cargo-edit" from https://github.com/killercup/cargo-edit
 
-cargo update
-cargo upgrade --workspace
-cargo generate-lockfile
+DIRS=". docker-build-system"
+
+for d in $DIRS; do
+	cd ${d}
+	cargo update
+	cargo upgrade # --pinned --incompatible
+	cargo generate-lockfile
+done
 

@@ -1,11 +1,12 @@
 use crate::utils::lookup_function;
-use pgx::*;
+use pgrx::*;
 use std::collections::HashSet;
 
 struct WalkContext {
     funcoid: pg_sys::Oid,
     targetlists: Vec<*mut pg_sys::List>,
     replacements: HashSet<pg_sys::Oid>,
+    modify_cnt: usize,
 }
 
 type NodePtr = *mut pg_sys::Node;
@@ -29,6 +30,7 @@ pub fn rewrite_opexrs(plan: *mut pg_sys::PlannedStmt) {
             funcoid,
             targetlists: Vec::new(),
             replacements: HashSet::new(),
+            modify_cnt: 0,
         };
 
         walk_node(plan as NodePtr, &mut context);
@@ -50,10 +52,50 @@ pub fn rewrite_opexrs(plan: *mut pg_sys::PlannedStmt) {
                             }
                             var.vartype = pg_sys::TIDOID;
 
-                            #[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12"))]
+                            #[cfg(any(feature = "pg12"))]
                             {
                                 var.varoattno = -1;
                             }
+                        }
+                    } else if is_a(expr as NodePtr, pg_sys::NodeTag_T_FuncExpr) {
+                        const C: &std::ffi::CStr =
+                            unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"c\0") };
+
+                        let mut funcexpr = PgBox::from_pg(expr as *mut pg_sys::FuncExpr);
+                        if context.replacements.contains(&funcexpr.funcresulttype) {
+                            let funcentry = pg_sys::SearchSysCache1(
+                                pg_sys::SysCacheIdentifier_PROCOID as _,
+                                funcexpr.funcid.into_datum().unwrap(),
+                            );
+                            let nargs =
+                                get_attr::<i16>(funcentry, pg_sys::Anum_pg_proc_pronargs).unwrap();
+                            if nargs == 1 {
+                                let lang = get_attr::<pg_sys::Oid>(
+                                    funcentry,
+                                    pg_sys::Anum_pg_proc_prolang,
+                                )
+                                .unwrap();
+                                if lang == pg_sys::get_language_oid(C.as_ptr(), false) {
+                                    let src =
+                                        get_attr::<String>(funcentry, pg_sys::Anum_pg_proc_prosrc)
+                                            .unwrap();
+                                    if src.trim() == "shadow_wrapper" {
+                                        funcexpr.funcresulttype = pg_sys::TIDOID;
+                                        let args = PgList::from_pg(funcexpr.args);
+                                        let first_arg = args.get_ptr(0).unwrap();
+                                        if is_a(first_arg, pg_sys::NodeTag_T_Var) {
+                                            if pg_sys::get_func_rettype(funcexpr.funcid)
+                                                == pg_sys::ANYELEMENTOID
+                                            {
+                                                let mut var =
+                                                    PgBox::<pg_sys::Var>::from_pg(first_arg.cast());
+                                                var.vartype = pg_sys::TIDOID;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            pg_sys::ReleaseSysCache(funcentry);
                         }
                     }
                 }
@@ -68,12 +110,24 @@ unsafe fn walk_plan(plan: *mut pg_sys::Plan, context: &mut WalkContext) {
     }
 
     let plan = PgBox::from_pg(plan);
-    context.targetlists.push(plan.targetlist);
+    let is_modify = is_a(plan.as_ptr() as NodePtr, pg_sys::NodeTag_T_ModifyTable);
+    if is_modify {
+        context.modify_cnt += 1;
+    }
+
+    if context.modify_cnt == 0 {
+        context.targetlists.push(plan.targetlist);
+    }
+
     walk_node(plan.targetlist as NodePtr, context);
     walk_node(plan.initPlan as NodePtr, context);
     walk_node(plan.lefttree as NodePtr, context);
     walk_node(plan.righttree as NodePtr, context);
     walk_node(plan.qual as NodePtr, context);
+
+    if is_modify {
+        context.modify_cnt -= 1;
+    }
 }
 
 #[allow(clippy::cognitive_complexity)]
@@ -86,11 +140,11 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
     }
 
     let is_incremental_sort_node = {
-        #[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12"))]
+        #[cfg(any(feature = "pg12"))]
         {
             false
         }
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             is_a(node, pg_sys::NodeTag_T_IncrementalSort)
         }
@@ -102,7 +156,14 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
         walk_node(stmt.subplans as NodePtr, context);
     } else if is_a(node, pg_sys::NodeTag_T_SeqScan) {
         let mut seqscan = PgBox::from_pg(node as *mut pg_sys::SeqScan);
-        walk_plan(&mut seqscan.plan, context);
+        #[cfg(not(feature = "pg15"))]
+        {
+            walk_plan(&mut seqscan.plan, context);
+        }
+        #[cfg(feature = "pg15")]
+        {
+            walk_plan(&mut seqscan.scan.plan, context);
+        }
     } else if is_a(node, pg_sys::NodeTag_T_IndexScan) {
         let mut scan = PgBox::from_pg(node as *mut pg_sys::IndexScan);
         walk_plan(&mut scan.scan.plan, context);
@@ -126,11 +187,11 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
     } else if is_a(node, pg_sys::NodeTag_T_ModifyTable) {
         let mut modifytable = PgBox::from_pg(node as *mut pg_sys::ModifyTable);
         walk_plan(&mut modifytable.plan, context);
-        #[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12", feature = "pg13"))]
+        #[cfg(any(feature = "pg12", feature = "pg13"))]
         {
             walk_node(modifytable.plans as NodePtr, context);
         }
-        #[cfg(any(feature = "pg14"))]
+        #[cfg(any(feature = "pg14", feature = "pg15"))]
         {
             walk_node(modifytable.updateColnosLists as NodePtr, context);
         }
@@ -250,7 +311,7 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
         let mut sort: PgBox<pg_sys::Sort> = PgBox::from_pg(node as *mut pg_sys::Sort);
         walk_plan(&mut sort.plan, context);
     } else if is_incremental_sort_node {
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             let mut incremental_sort: PgBox<pg_sys::IncrementalSort> =
                 PgBox::from_pg(node as *mut pg_sys::IncrementalSort);
@@ -295,7 +356,7 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
         let mut join = PgBox::from_pg(node as *mut pg_sys::HashJoin);
         walk_node(join.hashclauses as NodePtr, context);
 
-        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             walk_node(join.hashcollations as NodePtr, context);
             walk_node(join.hashkeys as NodePtr, context);
@@ -308,7 +369,7 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
     } else if is_a(node, pg_sys::NodeTag_T_Hash) {
         let mut hash = PgBox::from_pg(node as *mut pg_sys::Hash);
         walk_plan(&mut hash.plan, context);
-        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14", feature = "pg15"))]
         walk_node(hash.hashkeys as NodePtr, context);
     } else if is_a(node, pg_sys::NodeTag_T_WindowFunc) {
         let windowfunc = PgBox::from_pg(node as *mut pg_sys::WindowFunc);
@@ -339,7 +400,7 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
                     if first_arg.vartype != pg_sys::TIDOID {
                         context.replacements.insert(first_arg.vartype);
                         first_arg.vartype = pg_sys::TIDOID;
-                        #[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12"))]
+                        #[cfg(any(feature = "pg12"))]
                         {
                             first_arg.varoattno = -1;
                         }
@@ -356,7 +417,7 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
                         let mut var = PgBox::from_pg(first_arg as *mut pg_sys::Var);
                         context.replacements.insert(func_expr.funcresulttype);
                         var.vartype = pg_sys::TIDOID;
-                        #[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12"))]
+                        #[cfg(any(feature = "pg12"))]
                         {
                             var.varoattno = -1;
                         }
@@ -419,7 +480,7 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
         walk_node(expr.elemexpr as NodePtr, context);
     } else {
         let mut did_it = false;
-        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14", feature = "pg15"))]
         if is_a(node, pg_sys::NodeTag_T_SubscriptingRef) {
             let subscript = PgBox::from_pg(node as *mut pg_sys::SubscriptingRef);
             walk_node(subscript.refupperindexpr as NodePtr, context);
@@ -429,18 +490,31 @@ unsafe fn walk_node(node: NodePtr, context: &mut WalkContext) {
             did_it |= true;
         }
 
-        #[cfg(any(feature = "pg10", feature = "pg11"))]
-        if is_a(node, pg_sys::NodeTag_T_ArrayRef) {
-            let arrayref = PgBox::from_pg(node as *mut pg_sys::ArrayRef);
-            walk_node(arrayref.refupperindexpr as NodePtr, context);
-            walk_node(arrayref.reflowerindexpr as NodePtr, context);
-            walk_node(arrayref.refexpr as NodePtr, context);
-            walk_node(arrayref.refassgnexpr as NodePtr, context);
+        #[cfg(any(feature = "pg14", feature = "pg15"))]
+        if is_a(node, pg_sys::NodeTag_T_Memoize) {
+            let mut memoize = PgBox::from_pg(node as *mut pg_sys::Memoize);
+            walk_plan(&mut memoize.plan, context);
+            walk_node(memoize.param_exprs as NodePtr, context);
             did_it |= true;
         }
 
         if !did_it {
             debug1!("unrecognized tag: {}", node.as_ref().unwrap().type_);
         }
+    }
+}
+
+fn get_attr<T: FromDatum>(entry: pg_sys::HeapTuple, attribute: u32) -> Option<T> {
+    unsafe {
+        // SAFETY:  SysCacheGetAttr will give us what we need to create a Datum of type T,
+        // and this PgProc type ensures we have a valid "arg_tup" pointer for the cache entry
+        let mut is_null = false;
+        let datum = pg_sys::SysCacheGetAttr(
+            pg_sys::SysCacheIdentifier_PROCOID as _,
+            entry,
+            attribute as _,
+            &mut is_null,
+        );
+        T::from_datum(datum, is_null)
     }
 }

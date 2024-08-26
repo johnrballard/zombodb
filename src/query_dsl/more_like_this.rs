@@ -1,7 +1,7 @@
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -70,23 +70,23 @@ mod dsl {
     }
 
     #[pg_extern(immutable, parallel_safe, name = "more_like_this")]
-    fn more_like_this_with_array(
-        like: Array<&str>,
+    fn more_like_this_with_array<'a>(
+        like: Array<'a, &'a str>,
         stop_words:
-            default!(Array<&str>, "ARRAY['http', 'span', 'class', 'flashtext', 'let', 'its', 'may', 'well', 'got', 'too', 'them', 'really', 'new', 'set', 'please', 'how', 'our', 'from', 'sent', 'subject', 'sincerely', 'thank', 'thanks', 'just', 'get', 'going', 'were', 'much', 'can', 'also', 'she', 'her', 'him', 'his', 'has', 'been', 'ok', 'still', 'okay', 'does', 'did', 'about', 'yes', 'you', 'your', 'when', 'know', 'have', 'who', 'what', 'where', 'sir', 'page', 'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'if', 'in', 'into', 'is', 'it', 'no', 'not', 'of', 'on', 'or', 'such', 'that', 'the', 'their', 'than', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'will', 'with']"),
-        fields: Option<default!(Array<&str>, NULL)>,
-        boost: Option<default!(f32, NULL)>,
-        unlike: Option<default!(&str, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        minimum_should_match: Option<default!(i32, NULL)>,
-        boost_terms: Option<default!(f32, NULL)>,
-        include: Option<default!(bool, NULL)>,
-        min_term_freq: Option<default!(i64, NULL)>,
-        max_query_terms: Option<default!(i64, NULL)>,
-        min_doc_freq: Option<default!(i64, NULL)>,
-        max_doc_freq: Option<default!(i64, NULL)>,
-        min_word_length: Option<default!(i64, NULL)>,
-        max_word_length: Option<default!(i64, NULL)>,
+            default!(Array<'a, &'a str>, "ARRAY['http', 'span', 'class', 'flashtext', 'let', 'its', 'may', 'well', 'got', 'too', 'them', 'really', 'new', 'set', 'please', 'how', 'our', 'from', 'sent', 'subject', 'sincerely', 'thank', 'thanks', 'just', 'get', 'going', 'were', 'much', 'can', 'also', 'she', 'her', 'him', 'his', 'has', 'been', 'ok', 'still', 'okay', 'does', 'did', 'about', 'yes', 'you', 'your', 'when', 'know', 'have', 'who', 'what', 'where', 'sir', 'page', 'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'if', 'in', 'into', 'is', 'it', 'no', 'not', 'of', 'on', 'or', 'such', 'that', 'the', 'their', 'than', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'will', 'with']"),
+        fields: default!(Option<Array<'a, &'a str>>, NULL),
+        boost: default!(Option<f32>, NULL),
+        unlike: default!(Option<&'a str>, NULL),
+        analyzer: default!(Option<&'a str>, NULL),
+        minimum_should_match: default!(Option<i32>, NULL),
+        boost_terms: default!(Option<f32>, NULL),
+        include: default!(Option<bool>, NULL),
+        min_term_freq: default!(Option<i64>, NULL),
+        max_query_terms: default!(Option<i64>, NULL),
+        min_doc_freq: default!(Option<i64>, NULL),
+        max_doc_freq: default!(Option<i64>, NULL),
+        min_word_length: default!(Option<i64>, NULL),
+        max_word_length: default!(Option<i64>, NULL),
     ) -> ZDBQuery {
         let morelikethis = MoreLikeThisArray {
             like,
@@ -114,23 +114,23 @@ mod dsl {
     }
 
     #[pg_extern(immutable, parallel_safe, name = "more_like_this")]
-    fn more_like_this_without_array(
-        like: &str,
-        fields: Option<default!(Array<&str>, NULL)>,
+    fn more_like_this_without_array<'a>(
+        like: &'a str,
+        fields: default!(Option<Array<'a, &'a str>>, NULL),
         stop_words:
-            default!(Array<&str>, "ARRAY['http', 'span', 'class', 'flashtext', 'let', 'its', 'may', 'well', 'got', 'too', 'them', 'really', 'new', 'set', 'please', 'how', 'our', 'from', 'sent', 'subject', 'sincerely', 'thank', 'thanks', 'just', 'get', 'going', 'were', 'much', 'can', 'also', 'she', 'her', 'him', 'his', 'has', 'been', 'ok', 'still', 'okay', 'does', 'did', 'about', 'yes', 'you', 'your', 'when', 'know', 'have', 'who', 'what', 'where', 'sir', 'page', 'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'if', 'in', 'into', 'is', 'it', 'no', 'not', 'of', 'on', 'or', 'such', 'that', 'the', 'their', 'than', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'will', 'with']"),
-        boost: Option<default!(f32, NULL)>,
-        unlike: Option<default!(&str, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        minimum_should_match: Option<default!(i32, NULL)>,
-        boost_terms: Option<default!(f32, NULL)>,
-        include: Option<default!(bool, NULL)>,
-        min_term_freq: Option<default!(i64, NULL)>,
-        max_query_terms: Option<default!(i64, NULL)>,
-        min_doc_freq: Option<default!(i64, NULL)>,
-        max_doc_freq: Option<default!(i64, NULL)>,
-        min_word_length: Option<default!(i64, NULL)>,
-        max_word_length: Option<default!(i64, NULL)>,
+            default!(Array<'a, &'a str>, "ARRAY['http', 'span', 'class', 'flashtext', 'let', 'its', 'may', 'well', 'got', 'too', 'them', 'really', 'new', 'set', 'please', 'how', 'our', 'from', 'sent', 'subject', 'sincerely', 'thank', 'thanks', 'just', 'get', 'going', 'were', 'much', 'can', 'also', 'she', 'her', 'him', 'his', 'has', 'been', 'ok', 'still', 'okay', 'does', 'did', 'about', 'yes', 'you', 'your', 'when', 'know', 'have', 'who', 'what', 'where', 'sir', 'page', 'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'if', 'in', 'into', 'is', 'it', 'no', 'not', 'of', 'on', 'or', 'such', 'that', 'the', 'their', 'than', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'will', 'with']"),
+        boost: default!(Option<f32>, NULL),
+        unlike: default!(Option<&'a str>, NULL),
+        analyzer: default!(Option<&'a str>, NULL),
+        minimum_should_match: default!(Option<i32>, NULL),
+        boost_terms: default!(Option<f32>, NULL),
+        include: default!(Option<bool>, NULL),
+        min_term_freq: default!(Option<i64>, NULL),
+        max_query_terms: default!(Option<i64>, NULL),
+        min_doc_freq: default!(Option<i64>, NULL),
+        max_doc_freq: default!(Option<i64>, NULL),
+        min_word_length: default!(Option<i64>, NULL),
+        max_word_length: default!(Option<i64>, NULL),
     ) -> ZDBQuery {
         let morelikethis = MoreLikeThis {
             like,
@@ -159,10 +159,10 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::*;
 
     #[pg_test]
@@ -186,7 +186,8 @@ mod tests {
                 6
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -222,7 +223,8 @@ mod tests {
                 'like_string'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -259,7 +261,8 @@ mod tests {
                 6
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -295,7 +298,8 @@ mod tests {
                 Array['like_string uno', 'string like dos', 'like string three']
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(

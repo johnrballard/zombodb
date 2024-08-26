@@ -1,34 +1,33 @@
 use crate::access_method::options::ZDBIndexOptions;
 use crate::elasticsearch::{Elasticsearch, ElasticsearchBulkRequest};
 use crate::gucs::ZDB_LOG_LEVEL;
-use crate::query_dsl::bool::dsl::{and, noteq};
+use crate::query_dsl::bool::dsl::{and_vec, noteq};
 use crate::query_dsl::range::dsl::range_numeric;
 use crate::query_dsl::terms_lookup::dsl::terms_lookup;
 use crate::zdbquery::ZDBQuery;
-use pgx::*;
+use pgrx::*;
 use serde::*;
 
 #[pg_guard]
 pub extern "C" fn ambulkdelete(
     info: *mut pg_sys::IndexVacuumInfo,
-    _stats: *mut pg_sys::IndexBulkDeleteResult,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
     _callback: pg_sys::IndexBulkDeleteCallback,
     _callback_state: *mut ::std::os::raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    let result = PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0();
     let info = unsafe { PgBox::from_pg(info) };
     let index_relation = unsafe { PgRelation::from_pg(info.index) };
 
     if ZDBIndexOptions::from_relation(&index_relation).is_shadow_index() {
         // nothing for us to do for a shadow index
-        return result.into_pg();
+        return stats;
     }
 
     let elasticsearch = Elasticsearch::new(&index_relation);
     let options = ZDBIndexOptions::from_relation(&index_relation);
     let es_index_name = options.index_name();
     let oldest_xmin = {
-        #[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12", feature = "pg13"))]
+        #[cfg(any(feature = "pg12", feature = "pg13"))]
         unsafe {
             pg_sys::TransactionIdLimitedForOldSnapshots(
                 pg_sys::GetOldestXmin(info.index, pg_sys::PROCARRAY_FLAGS_VACUUM as i32),
@@ -36,7 +35,7 @@ pub extern "C" fn ambulkdelete(
             )
         }
 
-        #[cfg(any(feature = "pg14"))]
+        #[cfg(any(feature = "pg14", feature = "pg15"))]
         unsafe {
             pg_sys::GetOldestNonRemovableTransactionId(std::ptr::null_mut())
             // let mut limit_xid = 0;
@@ -57,11 +56,10 @@ pub extern "C" fn ambulkdelete(
         .execute()
         .expect("failed to refresh index");
 
-    let mut bulk = elasticsearch.start_bulk();
-
     // Find all rows with what we think is an *aborted* xmin
     //
     // These rows can be deleted
+    let mut bulk = elasticsearch.start_bulk();
     let by_xmin = delete_by_xmin(
         &index_relation,
         &elasticsearch,
@@ -69,10 +67,12 @@ pub extern "C" fn ambulkdelete(
         oldest_xmin,
         &mut bulk,
     );
+    bulk.finish().expect("failed to finish delete_by_xmin");
 
     // Find all rows with what we think is a *committed* xmax
     //
     // These rows can be deleted
+    let mut bulk = elasticsearch.start_bulk();
     let by_xmax = delete_by_xmax(
         &index_relation,
         &elasticsearch,
@@ -80,10 +80,12 @@ pub extern "C" fn ambulkdelete(
         oldest_xmin,
         &mut bulk,
     );
+    bulk.finish().expect("failed to finish delete_by_xmax");
 
     // Find all rows with what we think is an *aborted* xmax
     //
     // These rows can have their xmax reset to null because they're still live
+    let mut bulk = elasticsearch.start_bulk();
     let vacuumed = vacuum_xmax(
         &index_relation,
         &elasticsearch,
@@ -91,12 +93,13 @@ pub extern "C" fn ambulkdelete(
         oldest_xmin,
         &mut bulk,
     );
+    bulk.finish().expect("failed to finish vacuum_xmax");
 
     // Finally, any "zdb_aborted_xid" value we have can be removed if it's
     // known to be aborted and no longer referenced anywhere in the index
+    let mut bulk = elasticsearch.start_bulk();
     let aborted = remove_aborted_xids(&index_relation, &elasticsearch, oldest_xmin, &mut bulk);
-
-    bulk.finish().expect("failed to finish vacuum");
+    bulk.finish().expect("failed to finish remove_aborted_xids");
 
     ZDB_LOG_LEVEL.get().log(&format!(
         "[zombodb] vacuum:  index={}, by_xmin={}, by_xmax={}, vacuumed={}, aborted_xids_removed={}",
@@ -106,7 +109,7 @@ pub extern "C" fn ambulkdelete(
         vacuumed,
         aborted
     ));
-    result.into_pg()
+    stats
 }
 
 #[pg_guard]
@@ -114,17 +117,23 @@ pub extern "C" fn amvacuumcleanup(
     info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    let result = PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0();
     let info = unsafe { PgBox::from_pg(info) };
     let index_relation = unsafe { PgRelation::from_pg(info.index) };
+    let mut stats = stats;
 
-    if ZDBIndexOptions::from_relation(&index_relation).is_shadow_index() {
-        // nothing for us to do for a shadow index
-        return result.into_pg();
+    if info.analyze_only {
+        return stats;
     }
 
     if stats.is_null() {
-        ambulkdelete(info.as_ptr(), result.as_ptr(), None, std::ptr::null_mut());
+        stats =
+            unsafe { pg_sys::palloc0(std::mem::size_of::<pg_sys::IndexBulkDeleteResult>()).cast() };
+        ambulkdelete(info.as_ptr(), stats, None, std::ptr::null_mut());
+    }
+
+    if ZDBIndexOptions::from_relation(&index_relation).is_shadow_index() {
+        // nothing for us to do for a shadow index
+        return stats;
     }
 
     let elasticsearch = Elasticsearch::new(&index_relation);
@@ -134,7 +143,7 @@ pub extern "C" fn amvacuumcleanup(
         .execute()
         .expect("failed to expunge deleted docs");
 
-    result.into_pg()
+    stats
 }
 
 fn remove_aborted_xids(
@@ -332,7 +341,7 @@ fn delete_by_xmin(
 ///     dsl.terms_lookup('zdb_xmin', zdb.index_name(index), type, 'zdb_aborted_xids', 'zdb_aborted_xids')
 /// );
 fn vac_by_xmin(es_index_name: &str, xmin: i64) -> ZDBQuery {
-    and(vec![
+    and_vec(vec![
         Some(range_numeric(
             "zdb_xmin",
             Some(xmin),
@@ -358,7 +367,7 @@ fn vac_by_xmin(es_index_name: &str, xmin: i64) -> ZDBQuery {
 ///     dsl.noteq(dsl.terms_lookup('zdb_xmax', zdb.index_name(index), type, 'zdb_aborted_xids', 'zdb_aborted_xids'))
 /// );
 fn vac_by_xmax(es_index_name: &str, xmax: i64) -> ZDBQuery {
-    and(vec![
+    and_vec(vec![
         Some(range_numeric(
             "zdb_xmax",
             Some(xmax),
@@ -384,7 +393,7 @@ fn vac_by_xmax(es_index_name: &str, xmax: i64) -> ZDBQuery {
 ///    dsl.terms_lookup('zdb_xmax', zdb.index_name(index), type, 'zdb_aborted_xids', 'zdb_aborted_xids')
 /// );
 fn vac_by_aborted_xmax(es_index_name: &str, xmax: i64) -> ZDBQuery {
-    and(vec![
+    and_vec(vec![
         Some(range_numeric(
             "zdb_xmax",
             Some(xmax),

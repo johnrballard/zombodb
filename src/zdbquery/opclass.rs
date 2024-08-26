@@ -3,8 +3,8 @@ use crate::executor_manager::get_executor_manager;
 use crate::gucs::ZDB_DEFAULT_ROW_ESTIMATE;
 use crate::utils::get_heap_relation_for_func_expr;
 use crate::zdbquery::ZDBQuery;
-use pgx::*;
-use std::collections::HashSet;
+use pgrx::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[pg_extern(immutable, parallel_safe)]
 fn anyelement_cmpfunc(
@@ -21,28 +21,28 @@ fn anyelement_cmpfunc(
         None => return false,
     };
 
-    let tid = if element.oid() == pg_sys::TIDOID {
-        // use the ItemPointerData passed into us as the first argument
-        Some(item_pointer_to_u64(
-            unsafe { pg_sys::ItemPointerData::from_datum(element.datum(), false, element.oid()) }
-                .unwrap(),
-        ))
-    } else {
-        panic!(
-            "The '==>' operator could not find a \"USING zombodb\" index that matches the left-hand-side of the expression"
-        );
-    };
+    // SAFETY:  Right here, we require that the actual Datum behind `element` be an [`ItemPointerData`]
+    //  and it will be so long as ZomboDB's rewriter has run.  The only way that wouldn't happen is
+    //  if "zombodb.so" wasn't loaded by the time we got here, and is literally impossible since this
+    //  function is in "zombodb.so"
+    let tid = item_pointer_to_u64(
+        unsafe { pg_sys::ItemPointerData::from_datum(element.datum(), false) }.unwrap(),
+    );
 
-    match tid {
-        Some(tid) => unsafe {
-            pg_func_extra(fcinfo, || do_seqscan(query, index_oid)).contains(&tid)
-        },
-        None => false,
+    unsafe {
+        let mut lookup_by_query = pg_func_extra(fcinfo, || {
+            FxHashMap::<(pg_sys::Oid, Option<String>), FxHashSet<u64>>::default()
+        });
+
+        lookup_by_query
+            .entry((index_oid, query.query_string()))
+            .or_insert_with(|| do_seqscan(query, index_oid))
+            .contains(&tid)
     }
 }
 
 #[inline]
-fn do_seqscan(query: ZDBQuery, index_oid: u32) -> HashSet<u64> {
+fn do_seqscan(query: ZDBQuery, index_oid: pg_sys::Oid) -> FxHashSet<u64> {
     unsafe {
         let index = pg_sys::index_open(index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let heap = pg_sys::relation_open(
@@ -56,20 +56,10 @@ fn do_seqscan(query: ZDBQuery, index_oid: u32) -> HashSet<u64> {
         let scan = pg_sys::index_beginscan(heap, index, pg_sys::GetTransactionSnapshot(), 1, 0);
         pg_sys::index_rescan(scan, keys.into_pg(), 1, std::ptr::null_mut(), 0);
 
-        let mut lookup = HashSet::new();
+        let mut lookup = FxHashSet::default();
         loop {
             check_for_interrupts!();
 
-            #[cfg(any(feature = "pg10", feature = "pg11"))]
-            let tid = {
-                let htup = pg_sys::index_getnext(scan, pg_sys::ScanDirection_ForwardScanDirection);
-                if htup.is_null() {
-                    break;
-                }
-                item_pointer_to_u64(htup.as_ref().unwrap().t_self)
-            };
-
-            #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
             let tid = {
                 let slot = pg_sys::MakeSingleTupleTableSlot(
                     heap.as_ref().unwrap().rd_att,
@@ -146,7 +136,10 @@ fn restrict(
             if heaprel_id == pg_sys::InvalidOid {
                 heap_relation = None;
             } else {
-                heap_relation = Some(PgRelation::open(heaprel_id));
+                heap_relation = Some(PgRelation::with_lock(
+                    heaprel_id,
+                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                ));
             }
 
             // free the ldata struct
@@ -164,12 +157,9 @@ fn restrict(
                 if pg_sys::type_is_array(rconst.consttype) {
                     count_estimate = ZDB_DEFAULT_ROW_ESTIMATE.get() as u64;
                 } else {
-                    let zdbquery: ZDBQuery = ZDBQuery::from_datum(
-                        rconst.constvalue,
-                        rconst.constisnull,
-                        rconst.consttype,
-                    )
-                    .expect("rhs of ==> is NULL");
+                    let zdbquery: ZDBQuery =
+                        ZDBQuery::from_datum(rconst.constvalue, rconst.constisnull)
+                            .expect("rhs of ==> is NULL");
 
                     let estimate = zdbquery
                         .row_estimate()

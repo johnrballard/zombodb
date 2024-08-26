@@ -1,6 +1,6 @@
-use pgx::{
-    pg_sys, register_xact_callback, IntoDatum, PgOid, PgRelation, PgXactCallbackEvent, Spi,
-    SpiTupleTable,
+use pgrx::spi::SpiTupleTable;
+use pgrx::{
+    pg_sys, register_xact_callback, spi, IntoDatum, PgOid, PgRelation, PgXactCallbackEvent, Spi,
 };
 
 use crate::elasticsearch::Elasticsearch;
@@ -27,7 +27,7 @@ pub fn drop_index(index: &PgRelation) {
 }
 
 pub fn drop_table(table: &PgRelation) {
-    for index in table.indicies(pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE) {
+    for index in table.indices(pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE) {
         drop_index(&index);
     }
 }
@@ -36,14 +36,15 @@ pub fn drop_schema(schema_oid: pg_sys::Oid) {
     Spi::connect(|client| {
         let table = client.select(
             "select oid from pg_class
-                    where relnamespace = $1 
+                    where relnamespace = $1
                       and relam = (select oid from pg_am where amname = 'zombodb')",
             None,
             Some(vec![(PgOid::from(pg_sys::OIDOID), schema_oid.into_datum())]),
-        );
+        )?;
         drop_index_oids(table);
-        Ok(Some(()))
-    });
+        Ok::<_, spi::Error>(())
+    })
+    .expect("SPI failed")
 }
 
 pub fn drop_extension(extension_oid: pg_sys::Oid) {
@@ -54,10 +55,11 @@ pub fn drop_extension(extension_oid: pg_sys::Oid) {
                     where relam = (select oid from pg_am where amname = 'zombodb')",
                 None,
                 None,
-            );
+            )?;
             drop_index_oids(table);
-            Ok(Some(()))
-        });
+            Ok::<_, spi::Error>(())
+        })
+        .expect("SPI failed");
     }
 }
 
@@ -65,8 +67,10 @@ fn drop_index_oids(mut table: SpiTupleTable) {
     while table.next().is_some() {
         let oid = table
             .get_one::<pg_sys::Oid>()
+            .expect("SPI failed")
             .expect("returned index oid is NULL");
-        let index = PgRelation::with_lock(oid, pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE);
+        let index =
+            unsafe { PgRelation::with_lock(oid, pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE) };
         drop_index(&index);
     }
 }

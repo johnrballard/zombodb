@@ -1,6 +1,6 @@
 #! /bin/bash
 #
-# Copyright 2018-2022 ZomboDB, LLC
+# Copyright 2018-2023 ZomboDB, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,8 @@
 
 PGVER=$1
 IMAGE=$2
-PGX_VERSION=$3
+PGRX_VERSION=$3
+DEBUG=$4
 
 if [ "x${PGVER}" == "x" ] || [ "x${IMAGE}" == "x" ] ; then
 	echo 'usage:  ./package.sh <PGVER> <image>'
@@ -39,28 +40,55 @@ OSNAME=$(echo ${IMAGE} | cut -f3-4 -d-)
 VERSION=$(cat zombodb.control | grep default_version | cut -f2 -d\')
 
 
-PG_CONFIG_DIR=$(dirname $(grep ${PGVER} ~/.pgx/config.toml | cut -f2 -d= | cut -f2 -d\"))
+PG_CONFIG_DIR=$(dirname $(grep ${PGVER} ~/.pgrx/config.toml | cut -f2 -d= | cut -f2 -d\"))
 export PATH=${PG_CONFIG_DIR}:${PATH}
 
 #
-# ensure cargo-pgx is the correct version
+# update Rust to the latest version
 #
-cargo install cargo-pgx --version $PGX_VERSION
+whoami
+pwd
+ls -la
+rustup update || exit 1
+
+#
+# ensure cargo-pgrx is the correct version and compiled with this Rust version
+#
+cargo install cargo-pgrx --version $PGRX_VERSION --locked
 
 #
 # build the extension
 #
-cargo pgx package || exit $?
+if [ "$DEBUG" == "true" ] ; then
+  cargo pgrx package --debug || exit $?
+else
+  cargo pgrx package --profile artifacts || exit $?
+fi
 
 #
 # cd into the package directory
 #
 ARTIFACTDIR=/artifacts
-BUILDDIR=/build/target/release/zombodb-pg${PGVER}
+
+if [ "$DEBUG" == "true" ] ; then
+  BUILDDIR=/build/target/debug/zombodb-pg${PGVER}
+else
+  BUILDDIR=/build/target/artifacts/zombodb-pg${PGVER}
+fi
+
+#
+# copy over the sql/releases/zombodb--pg${PGVER} the caller should have already made with `prepare-release.sh`
+#
+cp -v sql/releases/zombodb--${VERSION}.sql  ${BUILDDIR}$(pg_config --sharedir)/extension/ || exit $?
+
+# move into the build directory
+
 cd ${BUILDDIR} || exit $?
 
-# strip the binaries to make them smaller
-find ./ -name "*.so" -exec strip {} \;
+if [ "$DEBUG" == "false" ] ; then
+  # strip the binaries to make them smaller
+  find ./ -name "*.so" -exec strip {} \;
+fi
 
 #
 # then use 'fpm' to build either a .deb, .rpm or .apk
@@ -69,6 +97,14 @@ find ./ -name "*.so" -exec strip {} \;
 ## hack for when we installed ruby via rvm.  if it doesn't work we don't care
 source ~/.rvm/scripts/rvm
 
+# architecture name
+UNAME=$(uname -m)
+DEBUNAME=${UNAME}
+if [ "${DEBUNAME}" == "x86_64" ]; then
+    # name used for .deb packages is different for historical reasons
+    DEBUNAME="amd64"
+fi
+
 if [ "${PKG_FORMAT}" == "deb" ]; then
 	fpm \
 		-s dir \
@@ -76,8 +112,8 @@ if [ "${PKG_FORMAT}" == "deb" ]; then
 		-n zombodb-${PGVER} \
 		-v ${VERSION} \
 		--deb-no-default-config-files \
-		-p ${ARTIFACTDIR}/zombodb_${OSNAME}_pg${PGVER}-${VERSION}_amd64.deb \
-		-a amd64 \
+		-p ${ARTIFACTDIR}/zombodb_${OSNAME}_pg${PGVER}-${VERSION}_${DEBUNAME}.deb \
+		-a ${DEBUNAME} \
 		. || exit 1
 
 elif [ "${PKG_FORMAT}" == "rpm" ]; then
@@ -87,8 +123,8 @@ elif [ "${PKG_FORMAT}" == "rpm" ]; then
 		-n zombodb-${PGVER} \
 		-v ${VERSION} \
 		--rpm-os linux \
-		-p ${ARTIFACTDIR}/zombodb_${OSNAME}_pg${PGVER}-${VERSION}_1.x86_64.rpm \
-		-a x86_64 \
+		-p ${ARTIFACTDIR}/zombodb_${OSNAME}_pg${PGVER}-${VERSION}_1.${UNAME}.rpm \
+		-a ${UNAME} \
 		. || exit 1
 
 elif [ "${PKG_FORMAT}" == "apk" ]; then
@@ -97,8 +133,8 @@ elif [ "${PKG_FORMAT}" == "apk" ]; then
 		-t apk \
 		-n zombodb-${PGVER} \
 		-v ${VERSION} \
-		-p ${ARTIFACTDIR}/zombodb_${OSNAME}_pg${PGVER}-${VERSION}.$(uname -m).apk \
-		-a $(uname -m) \
+		-p ${ARTIFACTDIR}/zombodb_${OSNAME}_pg${PGVER}-${VERSION}.${UNAME}.apk \
+		-a ${UNAME} \
 		. \
 		|| exit 1
 

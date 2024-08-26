@@ -32,7 +32,7 @@ macro_rules! handle_result {
 
 }
 
-static PGVERS: &[u16; 5] = &[10, 11, 12, 13, 14];
+static PGVERS: &[u16; 4] = &[12, 13, 14, 15];
 
 fn do_exit() {
     // best effort to kill the docker process
@@ -72,11 +72,11 @@ fn main() -> Result<(), std::io::Error> {
         "     Setting".bold().green(),
         max_cpus
     );
-    let pgx_version = determine_pgx_version()?;
+    let pgrx_version = determine_pgrx_version()?;
     println!(
-        "{} pgx version to {}",
+        "{} pgrx version to {}",
         "     Setting".bold().green(),
-        pgx_version
+        pgrx_version
     );
 
     let targetdir = PathBuf::from_str("./target/zdb-build/").unwrap();
@@ -90,16 +90,18 @@ fn main() -> Result<(), std::io::Error> {
     std::fs::create_dir_all(&builddir).expect("failed to create builddir");
     std::fs::create_dir_all(&repodir).expect("failed to create repodir");
 
-    let mut args = std::env::args();
-    args.next(); // consume executable name
-    let branch = args.next().unwrap_or_else(|| {
-        exit_with_error!("usage:  cargo run <branch> [<docker-image-name> <pg major version>]")
+    let args = std::env::args().collect::<Vec<_>>();
+    let branch = args.get(1).unwrap_or_else(|| {
+        exit_with_error!(
+            "usage:  cargo run <branch> [<docker-image-name> <pg major version>] [--debug]"
+        )
     });
-    let user_image = args.next();
-    let user_pgver: Option<u16> = match args.next() {
+    let user_image = args.get(2);
+    let user_pgver: Option<u16> = match args.get(3) {
         Some(pgver) => Some(pgver.parse().expect("pgver is not a valid number")),
         None => None,
     };
+    let debug = args.last().cloned().unwrap_or_else(|| "false".into()) == "--debug";
     let dockerfiles = find_dockerfiles()?;
 
     handle_result!(git_clone(&branch, &repodir), "failed to clone ZomboDB repo");
@@ -114,7 +116,7 @@ fn main() -> Result<(), std::io::Error> {
 
     dockerfiles
         .par_iter()
-        .filter(|(image, _)| user_image.is_none() || user_image.as_ref().unwrap() == image)
+        .filter(|(image, _)| user_image.is_none() || user_image.as_ref().unwrap() == &image)
         .for_each(|(image, file)| {
             let dockerfile = handle_result!(
                 parse_dockerfile(&file),
@@ -147,7 +149,15 @@ fn main() -> Result<(), std::io::Error> {
 
                         let start = std::time::Instant::now();
                         handle_result!(
-                            docker_run(&image, *pgver, &repodir, &builddir, &artifactdir, &pgx_version),
+                            docker_run(
+                                &image,
+                                *pgver,
+                                &repodir,
+                                &builddir,
+                                &artifactdir,
+                                &pgrx_version,
+                                debug
+                            ),
                             "Failed to compile {} for {}",
                             image,
                             pgver
@@ -183,7 +193,15 @@ fn main() -> Result<(), std::io::Error> {
                     .for_each(|pgver| {
                         let start = std::time::Instant::now();
                         handle_result!(
-                            docker_run(&image, *pgver, &repodir, &builddir, &artifactdir, &pgx_version),
+                            docker_run(
+                                &image,
+                                *pgver,
+                                &repodir,
+                                &builddir,
+                                &artifactdir,
+                                &pgrx_version,
+                                debug
+                            ),
                             "Failed to compile {} for {}",
                             image,
                             pgver
@@ -214,10 +232,7 @@ fn remove_dir(dir: &PathBuf) {
     }
 }
 
-fn docker_build(
-    base_image: &str,
-    pgver: Option<u16>,
-) -> Result<String, std::io::Error> {
+fn docker_build(base_image: &str, pgver: Option<u16>) -> Result<String, std::io::Error> {
     let image_name = format!(
         "{}{}",
         base_image,
@@ -262,7 +277,8 @@ fn docker_run(
     repodir: &PathBuf,
     builddir: &PathBuf,
     artifactdir: &PathBuf,
-    pgx_version: &str,
+    pgrx_version: &str,
+    debug: bool,
 ) -> Result<String, std::io::Error> {
     let mut builddir = builddir.clone();
     builddir.push(&format!("{}-{}", image, pgver));
@@ -294,7 +310,9 @@ fn docker_run(
         .arg("-e")
         .arg(&format!("image={}", image))
         .arg("-e")
-        .arg(&format!("pgx_version={}", pgx_version))
+        .arg(&format!("pgrx_version={}", pgrx_version))
+        .arg("-e")
+        .arg(&format!("debug={}", debug))
         .arg("-w")
         .arg(&format!("/build"))
         .arg("--mount")
@@ -317,13 +335,14 @@ fn docker_run(
         .arg(image)
         .arg("bash")
         .arg("-c")
-        .arg("./docker-build-system/package.sh ${pgver} ${image} ${pgx_version}");
+        .arg("./docker-build-system/package.sh ${pgver} ${image} ${pgrx_version} ${debug}");
 
     println!(
-        "{} {} for pg{}",
+        "{} {} for pg{} as {}",
         "   Packaging".bold().green(),
         image,
-        pgver
+        pgver,
+        if debug { "--debug" } else { "--release" }
     );
 
     let command_str = format!("{:?}", command);
@@ -431,10 +450,10 @@ fn parse_dockerfile(filename: &PathBuf) -> Result<Vec<(String, Option<String>)>,
     Ok(map)
 }
 
-fn determine_pgx_version() -> Result<String, std::io::Error> {
+fn determine_pgrx_version() -> Result<String, std::io::Error> {
     let mut command = Command::new("cargo");
 
-    command.current_dir("../").arg("tree").arg("-i").arg("pgx");
+    command.current_dir("../").arg("tree").arg("-i").arg("pgrx");
 
     let output = command.output()?;
     let output = String::from_utf8(output.stdout).expect("invalid UTF8 output from cargo tree");

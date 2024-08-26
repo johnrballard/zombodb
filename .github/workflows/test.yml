@@ -1,4 +1,4 @@
-name: cargo pgx test pgXX
+name: cargo pgrx test pgrxX
 
 on:
   push:
@@ -10,14 +10,13 @@ jobs:
   test:
 
     runs-on: ${{ matrix.os }}
-    env:
-      ES_VERSION: "7.13.2"
     if: "!contains(github.event.head_commit.message, 'nogha')"
 
     strategy:
       matrix:
-        version: [10, 11, 12, 13, 14]
+        version: [12, 13, 14, 15]
         os: ["ubuntu-latest"]
+        es_version: ["7.17.0"]
 
     steps:
     - uses: actions/checkout@v2
@@ -34,33 +33,34 @@ jobs:
       run: |
         sudo apt-get update -y -qq --fix-missing
         sudo apt-get install -y wget gnupg
-        sudo bash -c 'echo deb http://apt.postgresql.org/pub/repos/apt/ focal-pgdg main >> /etc/apt/sources.list.d/pgdg.list'
+        sudo bash -c 'echo deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main >> /etc/apt/sources.list.d/pgdg.list'
+        sudo wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
         sudo apt update
 
       # Install Postgres
     - name: install postgres
-      run: sudo apt-get install -y clang-10 llvm-10 clang gcc make build-essential libz-dev zlib1g-dev strace libssl-dev pkg-config postgresql-${{ matrix.version }} postgresql-server-dev-${{ matrix.version }}
+      run: sudo apt-get install -y clang llvm gcc make build-essential libz-dev zlib1g-dev strace libssl-dev pkg-config postgresql-${{ matrix.version }} postgresql-server-dev-${{ matrix.version }}
 
     # download Elasticsearch
     - name: download Elasticsearch
-      run: curl -s https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-${ES_VERSION}-linux-x86_64.tar.gz | tar xzf -
+      run: curl -s https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-${{ matrix.es_version }}-linux-x86_64.tar.gz | tar xzf -
     - name: rename Elasticsearch
-      run: mv elasticsearch-${ES_VERSION} elasticsearch
+      run: mv elasticsearch-${{ matrix.es_version }} elasticsearch
 
     # update cargo indexes so we're sure we get the latest things from 'git' repo dependencies
     - name: cargo update
       run: cargo update
 
-      # install cargo-pgx
-    - name: install cargo-pgx
-      run: cargo install cargo-pgx
+      # install cargo-pgrx
+    - name: install cargo-pgrx
+      run: cargo install cargo-pgrx --version 0.9.8 --locked
 
-    # initialize pgx
-    - name: cargo pgx init
-      run: cargo pgx init --pg${{ matrix.version }}=`which pg_config`
+    # initialize pgrx
+    - name: cargo pgrx init
+      run: cargo pgrx init --pg${{ matrix.version }}=`which pg_config`
 
     - name: cat config.toml
-      run: cat ~/.pgx/config.toml
+      run: cat ~/.pgrx/config.toml
 
     - name: hack permissions
       run: sudo chmod a+rwx `pg_config --pkglibdir` `pg_config --sharedir`/extension /var/run/postgresql/

@@ -4,16 +4,17 @@ use crate::utils::{
     is_date_field, is_date_subfield, is_named_index_link, is_string_field, json_to_string,
 };
 use crate::zdbquery::ZDBQuery;
-use chrono::{TimeZone, Utc};
-use pgx::*;
+use chrono::{LocalResult, TimeZone, Utc};
+use pgrx::prelude::*;
+use pgrx::*;
 use serde::*;
 use serde_json::*;
 use std::collections::HashMap;
 use std::str::FromStr;
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 pub(crate) mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::Serialize;
 
     #[allow(non_camel_case_types)]
@@ -33,9 +34,9 @@ fn terms(
     index: PgRelation,
     field_name: &str,
     query: ZDBQuery,
-    size_limit: Option<default!(i32, 2147483647)>,
-    order_by: Option<default!(TermsOrderBy, "'count'")>,
-) -> impl std::iter::Iterator<Item = (name!(term, Option<String>), name!(doc_count, i64))> {
+    size_limit: default!(Option<i32>, 2147483647),
+    order_by: default!(Option<TermsOrderBy>, "'count'"),
+) -> TableIterator<(name!(term, Option<String>), name!(doc_count, i64))> {
     let order_by = match order_by.as_ref().unwrap_or(&TermsOrderBy::count) {
         // we flip the meaning of 'count' and 'reverse_count' here
         // as externally to Postgres we want 'count' to mean ascending and 'reverse_count' to mean descending
@@ -66,11 +67,11 @@ fn tally_not_nested(
     field_name: &str,
     stem: Option<&str>,
     query: ZDBQuery,
-    size_limit: Option<default!(i32, 2147483647)>,
-    order_by: Option<default!(TermsOrderBy, "'count'")>,
-    shard_size: Option<default!(i32, 2147483647)>,
-    count_nulls: Option<default!(bool, true)>,
-) -> impl std::iter::Iterator<Item = (name!(term, Option<String>), name!(count, i64))> {
+    size_limit: default!(Option<i32>, 2147483647),
+    order_by: default!(Option<TermsOrderBy>, "'count'"),
+    shard_size: default!(Option<i32>, 2147483647),
+    count_nulls: default!(Option<bool>, true),
+) -> TableIterator<'static, (name!(term, Option<String>), name!(count, i64))> {
     tally(
         index,
         field_name,
@@ -91,11 +92,11 @@ fn tally(
     is_nested: bool,
     stem: Option<&str>,
     query: ZDBQuery,
-    size_limit: Option<default!(i32, 2147483647)>,
-    order_by: Option<default!(TermsOrderBy, "'count'")>,
-    shard_size: Option<default!(i32, 2147483647)>,
-    count_nulls: Option<default!(bool, true)>,
-) -> impl std::iter::Iterator<Item = (name!(term, Option<String>), name!(count, i64))> {
+    size_limit: default!(Option<i32>, 2147483647),
+    order_by: default!(Option<TermsOrderBy>, "'count'"),
+    shard_size: default!(Option<i32>, 2147483647),
+    count_nulls: default!(Option<bool>, true),
+) -> TableIterator<'static, (name!(term, Option<String>), name!(count, i64))> {
     #[derive(Deserialize)]
     struct BucketEntry {
         doc_count: u64,
@@ -134,6 +135,7 @@ fn tally(
         order: Value,
     }
 
+    #[derive(Debug)]
     #[allow(non_camel_case_types)]
     enum DateStem<'a> {
         year(Option<&'a str>),
@@ -218,14 +220,18 @@ fn tally(
         TermsOrderBy::reverse_term | TermsOrderBy::reverse_key => json! {{ "_key": "desc" }},
     };
 
-    let field_name = if is_date_subfield {
+    let field_name = if is_date_subfield && (stem.is_none() || date_stem.is_some()) {
         format!("{}.date", field_name)
+    } else if is_date_subfield && (field_name.ends_with(".date") && stem.is_some()) {
+        format!("{}", field_name.rsplitn(2, '.').skip(1).next().unwrap())
     } else {
         field_name.into()
     };
     let body = Terms {
         field: field_name.clone(),
-        include: if is_raw_date_field || !is_string_field {
+        include: if date_stem.is_some()
+            || !is_date_subfield && (is_raw_date_field || !is_string_field)
+        {
             None
         } else {
             match stem {
@@ -326,29 +332,34 @@ fn tally(
         None
     };
 
-    nulls
-        .into_iter()
-        .chain(terms.buckets.into_iter().map(|entry| {
-            match entry.key_as_string {
-                Some(key) => (Some(key), entry.doc_count),
-                None => {
-                    let mut key = json_to_string(entry.key);
+    TableIterator::new(
+        nulls
+            .into_iter()
+            .chain(terms.buckets.into_iter().map(|entry| {
+                match entry.key_as_string {
+                    Some(key) => (Some(key), entry.doc_count),
+                    None => {
+                        let mut key = json_to_string(entry.key);
 
-                    if is_raw_date_field && key.is_some() && !is_date_field {
-                        // convert raw date field values into a human-readable string
-                        let epoch =
-                            i64::from_str(&key.unwrap()).expect("date value not in epoch form");
-                        let utc = Utc.timestamp_millis(epoch);
-                        key = Some(utc.to_string());
+                        if is_raw_date_field && key.is_some() && !is_date_field && stem.is_none() {
+                            // convert raw date field values into a human-readable string
+                            let epoch =
+                                i64::from_str(&key.unwrap()).expect("date value not in epoch form");
+                            let utc = match Utc.timestamp_millis_opt(epoch) {
+                                LocalResult::Single(utc) => utc,
+                                _ => panic!("invalid millisecond timestamp value"),
+                            };
+                            key = Some(utc.to_string());
+                        }
+
+                        (key, entry.doc_count)
                     }
-
-                    (key, entry.doc_count)
                 }
-            }
-        }))
-        .map(|(key, doc_count)| (key, doc_count as i64))
-        .collect::<Vec<_>>()
-        .into_iter()
+            }))
+            .map(|(key, doc_count)| (key, doc_count as i64))
+            .collect::<Vec<_>>()
+            .into_iter(),
+    )
 }
 
 // need to hand-write the DDL for this b/c naming this function "terms_array"
@@ -372,8 +383,8 @@ pub(crate) fn terms_array_agg(
     index: PgRelation,
     field: &str,
     query: ZDBQuery,
-    size_limit: Option<default!(i32, 2147483647)>,
-    order_by: Option<default!(TermsOrderBy, "'count'")>,
+    size_limit: default!(Option<i32>, 2147483647),
+    order_by: default!(Option<TermsOrderBy>, "'count'"),
 ) -> Vec<Option<String>> {
     terms(index, field, query, size_limit, order_by)
         .map(|(term, _)| term)

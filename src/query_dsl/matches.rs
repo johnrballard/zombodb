@@ -1,6 +1,6 @@
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
 
     #[allow(non_camel_case_types)]
@@ -28,11 +28,11 @@ mod pg_catalog {
     }
 }
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::query_dsl::matches::pg_catalog::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -130,18 +130,18 @@ mod dsl {
     fn match_wrapper(
         field: &str,
         query: &str,
-        boost: Option<default!(f32, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        minimum_should_match: Option<default!(i32, NULL)>,
-        lenient: Option<default!(bool, NULL)>,
-        fuzziness: Option<default!(i32, NULL)>,
-        fuzzy_rewrite: Option<default!(&str, NULL)>,
-        fuzzy_transpositions: Option<default!(bool, NULL)>,
-        prefix_length: Option<default!(i32, NULL)>,
-        cutoff_frequency: Option<default!(f32, NULL)>,
-        auto_generate_synonyms_phrase_query: Option<default!(bool, NULL)>,
-        zero_terms_query: Option<default!(ZeroTermsQuery, NULL)>,
-        operator: Option<default!(Operator, NULL)>,
+        boost: default!(Option<f32>, NULL),
+        analyzer: default!(Option<&str>, NULL),
+        minimum_should_match: default!(Option<i32>, NULL),
+        lenient: default!(Option<bool>, NULL),
+        fuzziness: default!(Option<i32>, NULL),
+        fuzzy_rewrite: default!(Option<&str>, NULL),
+        fuzzy_transpositions: default!(Option<bool>, NULL),
+        prefix_length: default!(Option<i32>, NULL),
+        cutoff_frequency: default!(Option<f32>, NULL),
+        auto_generate_synonyms_phrase_query: default!(Option<bool>, NULL),
+        zero_terms_query: default!(Option<ZeroTermsQuery>, NULL),
+        operator: default!(Option<Operator>, NULL),
     ) -> ZDBQuery {
         let match_ = Match_ {
             query,
@@ -168,22 +168,22 @@ mod dsl {
     }
 
     #[pg_extern(immutable, parallel_safe)]
-    fn multi_match(
-        fields: Array<&str>,
-        query: &str,
-        boost: Option<default!(f32, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        minimum_should_match: Option<default!(i32, NULL)>,
-        lenient: Option<default!(bool, NULL)>,
-        fuzziness: Option<default!(i32, NULL)>,
-        fuzzy_rewrite: Option<default!(&str, NULL)>,
-        fuzzy_transpositions: Option<default!(bool, NULL)>,
-        prefix_length: Option<default!(i32, NULL)>,
-        cutoff_frequency: Option<default!(f32, NULL)>,
-        auto_generate_synonyms_phrase_query: Option<default!(bool, NULL)>,
-        zero_terms_query: Option<default!(ZeroTermsQuery, NULL)>,
-        operator: Option<default!(Operator, NULL)>,
-        match_type: Option<default!(MatchType, NULL)>,
+    fn multi_match<'a>(
+        fields: Array<'a, &'a str>,
+        query: &'a str,
+        boost: default!(Option<f32>, NULL),
+        analyzer: default!(Option<&'a str>, NULL),
+        minimum_should_match: default!(Option<i32>, NULL),
+        lenient: default!(Option<bool>, NULL),
+        fuzziness: default!(Option<i32>, NULL),
+        fuzzy_rewrite: default!(Option<&'a str>, NULL),
+        fuzzy_transpositions: default!(Option<bool>, NULL),
+        prefix_length: default!(Option<i32>, NULL),
+        cutoff_frequency: default!(Option<f32>, NULL),
+        auto_generate_synonyms_phrase_query: default!(Option<bool>, NULL),
+        zero_terms_query: default!(Option<ZeroTermsQuery>, NULL),
+        operator: default!(Option<Operator>, NULL),
+        match_type: default!(Option<MatchType>, NULL),
     ) -> ZDBQuery {
         let multimatch = MultiMatched {
             query,
@@ -213,10 +213,10 @@ mod dsl {
     fn match_phrase(
         field: &str,
         query: &str,
-        boost: Option<default!(f32, NULL)>,
-        slop: Option<default!(i32, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        zero_terms_query: Option<default!(ZeroTermsQuery, NULL)>,
+        boost: default!(Option<f32>, NULL),
+        slop: default!(Option<i32>, NULL),
+        analyzer: default!(Option<&str>, NULL),
+        zero_terms_query: default!(Option<ZeroTermsQuery>, NULL),
     ) -> ZDBQuery {
         let match_phrase = MatchPhrase {
             query,
@@ -238,10 +238,10 @@ mod dsl {
     fn phrase(
         field: &str,
         query: &str,
-        boost: Option<default!(f32, NULL)>,
-        slop: Option<default!(i32, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        zero_terms_query: Option<default!(ZeroTermsQuery, NULL)>,
+        boost: default!(Option<f32>, NULL),
+        slop: default!(Option<i32>, NULL),
+        analyzer: default!(Option<&str>, NULL),
+        zero_terms_query: default!(Option<ZeroTermsQuery>, NULL),
     ) -> ZDBQuery {
         match_phrase(field, query, boost, slop, analyzer, zero_terms_query)
     }
@@ -250,11 +250,11 @@ mod dsl {
     fn match_phrase_prefix(
         field: &str,
         query: &str,
-        boost: Option<default!(f32, NULL)>,
-        slop: Option<default!(i32, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        maxexpansion: Option<default!(i32, NULL)>,
-        zero_terms_query: Option<default!(ZeroTermsQuery, NULL)>,
+        boost: default!(Option<f32>, NULL),
+        slop: default!(Option<i32>, NULL),
+        analyzer: default!(Option<&str>, NULL),
+        maxexpansion: default!(Option<i32>, NULL),
+        zero_terms_query: default!(Option<ZeroTermsQuery>, NULL),
     ) -> ZDBQuery {
         let match_phrase_prefix = MatchPhrasePrefix {
             query,
@@ -275,10 +275,10 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::*;
 
     #[pg_test]
@@ -303,7 +303,8 @@ mod tests {
                 'and'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -340,7 +341,8 @@ mod tests {
                 'match_query'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -369,7 +371,8 @@ mod tests {
                     'match_query'
                 )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -412,7 +415,8 @@ mod tests {
                     'best_fields'
                 )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -449,7 +453,8 @@ mod tests {
                 'match_phrase_prefix_query'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -480,7 +485,8 @@ mod tests {
                 'none'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -510,7 +516,8 @@ mod tests {
                 'match_phrase_query'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -540,7 +547,8 @@ mod tests {
                 'none'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -569,7 +577,8 @@ mod tests {
                 'phrase_query'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -599,7 +608,8 @@ mod tests {
                 'none'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(

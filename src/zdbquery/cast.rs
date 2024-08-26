@@ -1,9 +1,9 @@
 use crate::zdbquery::ZDBQuery;
-use pgx::*;
+use pgrx::*;
 
 #[pg_extern(immutable, parallel_safe)]
 fn zdbquery_from_text(input: &str) -> ZDBQuery {
-    let cstr = pgx::cstr_core::CString::new(input).expect("CString::new() failed");
+    let cstr = std::ffi::CString::new(input).expect("CString::new() failed");
     ZDBQuery::input(cstr.as_c_str())
 }
 
@@ -39,10 +39,10 @@ CREATE CAST (zdbquery AS jsonb) WITH FUNCTION zdbquery_to_jsonb(zdbquery) AS IMP
 );
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::cast::zdbquery_from_text;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     #[pg_test]

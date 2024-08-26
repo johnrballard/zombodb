@@ -6,8 +6,9 @@ use crate::zql::transformations::field_finder::find_link_for_field;
 use crate::zql::{parse_field_lists, INDEX_LINK_PARSER};
 use lazy_static::*;
 use memoffset::*;
-use pgx::pg_sys::AsPgCStr;
-use pgx::*;
+use pgrx::pg_sys::AsPgCStr;
+use pgrx::prelude::*;
+use pgrx::*;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::fmt::Debug;
@@ -48,6 +49,7 @@ impl RefreshInterval {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 struct ZDBIndexOptionsInternal {
     /* varlena header (do not touch directly!) */
@@ -92,7 +94,7 @@ impl ZDBIndexOptionsInternal {
             panic!("'{}' is not a ZomboDB index", relation.name())
         } else if relation.rd_options.is_null() {
             // use defaults
-            let mut ops = PgBox::<ZDBIndexOptionsInternal>::alloc0();
+            let mut ops = unsafe { PgBox::<ZDBIndexOptionsInternal>::alloc0() };
             ops.compression_level = DEFAULT_COMPRESSION_LEVEL;
             ops.shards = DEFAULT_SHARDS;
             ops.replicas = ZDB_DEFAULT_REPLICAS.get();
@@ -108,13 +110,39 @@ impl ZDBIndexOptionsInternal {
             ops.nested_object_date_detection = false;
             ops.nested_object_numeric_detection = false;
             ops.include_source = true;
+            unsafe {
+                set_varsize(
+                    ops.as_ptr().cast(),
+                    std::mem::size_of::<ZDBIndexOptionsInternal>() as i32,
+                );
+            }
             ops.into_pg_boxed()
         } else {
             unsafe { PgBox::from_pg(relation.rd_options as *mut ZDBIndexOptionsInternal) }
         }
     }
 
-    fn url(&self) -> String {
+    fn into_bytes(options: PgBox<ZDBIndexOptionsInternal>) -> Vec<u8> {
+        unsafe {
+            let ptr = options.as_ptr().cast::<u8>();
+            let varsize = varsize(ptr.cast());
+            let mut bytes = Vec::with_capacity(varsize);
+            std::ptr::copy(ptr, bytes.as_mut_ptr(), varsize);
+            bytes.set_len(varsize);
+            bytes
+        }
+    }
+    fn copy_to(
+        options: &PgBox<ZDBIndexOptionsInternal>,
+        mut memcxt: PgMemoryContexts,
+    ) -> PgBox<ZDBIndexOptionsInternal> {
+        unsafe {
+            let ptr = options.as_ptr();
+            PgBox::from_pg(memcxt.copy_ptr_into(ptr.cast(), varsize(ptr.cast())))
+        }
+    }
+
+    fn url(&self, my_oid: pg_sys::Oid) -> String {
         let url = self.get_str(self.url_offset, || DEFAULT_URL.to_owned());
 
         if url == DEFAULT_URL {
@@ -122,6 +150,16 @@ impl ZDBIndexOptionsInternal {
             // in either case above, lets use the setting from postgresql.conf
             if ZDB_DEFAULT_ELASTICSEARCH_URL.get().is_some() {
                 ZDB_DEFAULT_ELASTICSEARCH_URL.get().unwrap()
+            } else if self.shadow_index {
+                // go find the url for this shadow index
+                // it's the url of the non-shadow zdb index
+                let (index, _) =
+                    find_zdb_index(unsafe { &PgRelation::open(my_oid) }).expect(&format!(
+                        "failed to lookup non-shadow index for oid={}",
+                        my_oid.as_u32()
+                    ));
+                let options = ZDBIndexOptions::from_relation(&index);
+                options.url()
             } else {
                 // the user hasn't provided one
                 panic!("Must set zdb.default_elasticsearch_url");
@@ -165,7 +203,7 @@ impl ZDBIndexOptionsInternal {
                 .unwrap(),
                 heaprel.name(),
                 indexrel.name(),
-                indexrel.oid()
+                indexrel.oid().as_u32()
             )
         })
     }
@@ -174,10 +212,10 @@ impl ZDBIndexOptionsInternal {
         self.get_str(self.uuid_offset, || {
             format!(
                 "{}.{}.{}.{}",
-                unsafe { pg_sys::MyDatabaseId },
-                indexrel.namespace_oid(),
-                heaprel.oid(),
-                indexrel.oid(),
+                unsafe { pg_sys::MyDatabaseId }.as_u32(),
+                indexrel.namespace_oid().as_u32(),
+                heaprel.oid().as_u32(),
+                indexrel.oid().as_u32(),
             )
         })
     }
@@ -239,42 +277,21 @@ impl ZDBIndexOptionsInternal {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ZDBIndexOptions {
+    internal: Vec<u8>,
     oid: pg_sys::Oid,
-    url: String,
-    type_name: String,
-    refresh_interval: RefreshInterval,
-    max_result_window: i32,
-    nested_fields_limit: i32,
-    nested_objects_limit: i32,
-    total_field_limit: i32,
-    max_terms_count: i32,
-    max_analyze_token_count: i32,
     alias: String,
     uuid: String,
-    translog_durability: String,
-    links: Option<Vec<String>>,
-    field_lists: Option<HashMap<String, Vec<QualifiedField>>>,
-    shadow_index: bool,
-
-    optimize_after: i32,
-    compression_level: i32,
-    shards: i32,
-    replicas: i32,
-    bulk_concurrency: i32,
-    batch_size: i32,
-    llapi: bool,
-
-    nested_object_date_detection: bool,
-    nested_object_numeric_detection: bool,
-    nested_object_text_mapping: serde_json::Value,
-
-    include_source: bool,
+    options: Option<Vec<String>>,
 }
 
 #[allow(dead_code)]
 impl ZDBIndexOptions {
+    pub fn is_shadow_index_fast(relation: &PgRelation) -> bool {
+        ZDBIndexOptionsInternal::from_relation(&relation).shadow_index
+    }
+
     pub fn from_relation(relation: &PgRelation) -> ZDBIndexOptions {
         let (relation, options) = find_zdb_index(relation).unwrap();
         ZDBIndexOptions::from_relation_no_lookup(&relation, options)
@@ -284,41 +301,33 @@ impl ZDBIndexOptions {
         relation: &PgRelation,
         options: Option<Vec<String>>,
     ) -> ZDBIndexOptions {
-        let internal = ZDBIndexOptionsInternal::from_relation(&relation);
         let heap_relation = relation.heap_relation().expect("not an index");
+        let internal = ZDBIndexOptionsInternal::from_relation(&relation);
+        let alias = internal.alias(&heap_relation, relation);
+        let uuid = internal.uuid(&heap_relation, relation);
+        let options = options.map_or_else(|| internal.links(), |v| Some(v));
+
         ZDBIndexOptions {
+            internal: ZDBIndexOptionsInternal::into_bytes(internal),
             oid: relation.oid(),
-            url: internal.url(),
-            type_name: internal.type_name(),
-            refresh_interval: internal.refresh_interval(),
-            max_result_window: internal.max_result_window,
-            nested_fields_limit: internal.nested_fields_limit,
-            nested_objects_limit: internal.nested_objects_limit,
-            total_field_limit: internal.total_fields_limit,
-            max_terms_count: internal.max_terms_count,
-            max_analyze_token_count: internal.max_analyze_token_count,
-            alias: internal.alias(&heap_relation, &relation),
-            uuid: internal.uuid(&heap_relation, &relation),
-            links: options.map_or_else(|| internal.links(), |v| Some(v)),
-            field_lists: internal.field_lists(),
-            shadow_index: internal.shadow_index,
-            compression_level: internal.compression_level,
-            shards: internal.shards,
-            replicas: internal.replicas,
-            bulk_concurrency: internal.bulk_concurrency,
-            batch_size: internal.batch_size,
-            optimize_after: internal.optimize_after,
-            translog_durability: internal.translog_durability(),
-            llapi: internal.llapi,
-            nested_object_date_detection: internal.nested_object_date_detection,
-            nested_object_numeric_detection: internal.nested_object_numeric_detection,
-            nested_object_text_mapping: internal.nested_object_text_mapping(),
-            include_source: internal.include_source,
+            alias,
+            uuid,
+            options,
+        }
+    }
+
+    #[inline(always)]
+    fn internal(&self) -> &ZDBIndexOptionsInternal {
+        let ptr = self.internal.as_ptr();
+        unsafe {
+            (ptr as *const _ as *const ZDBIndexOptionsInternal)
+                .as_ref()
+                .unwrap()
         }
     }
 
     pub fn index_relation(&self) -> PgRelation {
-        PgRelation::with_lock(self.oid(), pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+        unsafe { PgRelation::with_lock(self.oid(), pg_sys::AccessShareLock as pg_sys::LOCKMODE) }
     }
 
     pub fn heap_relation(&self) -> PgRelation {
@@ -330,67 +339,67 @@ impl ZDBIndexOptions {
     }
 
     pub fn optimize_after(&self) -> i32 {
-        self.optimize_after
+        self.internal().optimize_after
     }
 
     pub fn compression_level(&self) -> i32 {
-        self.compression_level
+        self.internal().compression_level
     }
 
     pub fn shards(&self) -> i32 {
-        self.shards
+        self.internal().shards
     }
 
     pub fn replicas(&self) -> i32 {
-        self.replicas
+        self.internal().replicas
     }
 
     pub fn bulk_concurrency(&self) -> i32 {
-        self.bulk_concurrency
+        self.internal().bulk_concurrency
     }
 
     pub fn batch_size(&self) -> i32 {
-        self.batch_size
+        self.internal().batch_size
     }
 
     pub fn llapi(&self) -> bool {
-        self.llapi
+        self.internal().llapi
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    pub fn url(&self) -> String {
+        self.internal().url(self.oid)
     }
 
-    pub fn type_name(&self) -> &str {
-        &self.type_name
+    pub fn type_name(&self) -> String {
+        self.internal().type_name()
     }
 
     pub fn refresh_interval(&self) -> RefreshInterval {
-        self.refresh_interval.clone()
+        self.internal().refresh_interval()
     }
 
     pub fn max_result_window(&self) -> i32 {
-        self.max_result_window
+        self.internal().max_result_window
     }
 
     pub fn nested_fields_limit(&self) -> i32 {
-        self.nested_fields_limit
+        self.internal().nested_fields_limit
     }
 
     pub fn nested_objects_limit(&self) -> i32 {
-        self.nested_objects_limit
+        self.internal().nested_objects_limit
     }
 
     pub fn total_fields_limit(&self) -> i32 {
-        self.total_field_limit
+        self.internal().total_fields_limit
     }
 
     pub fn max_terms_count(&self) -> i32 {
-        self.max_terms_count
+        self.internal().max_terms_count
     }
 
     pub fn max_analyze_token_count(&self) -> i32 {
-        self.max_analyze_token_count
+        self.internal().max_analyze_token_count
     }
 
     pub fn alias(&self) -> &str {
@@ -405,39 +414,36 @@ impl ZDBIndexOptions {
         &self.uuid
     }
 
-    pub fn translog_durability(&self) -> &str {
-        &self.translog_durability
+    pub fn translog_durability(&self) -> String {
+        self.internal().translog_durability()
     }
 
     pub fn links(&self) -> &Option<Vec<String>> {
-        &self.links
+        &self.options
     }
 
     pub fn field_lists(&self) -> HashMap<String, Vec<QualifiedField>> {
-        match &self.field_lists {
-            Some(field_lists) => field_lists.clone(),
-            None => HashMap::new(),
-        }
+        self.internal().field_lists().unwrap_or_default()
     }
 
     pub fn is_shadow_index(&self) -> bool {
-        self.shadow_index
+        self.internal().shadow_index
     }
 
     pub fn nested_object_date_detection(&self) -> bool {
-        self.nested_object_date_detection
+        self.internal().nested_object_date_detection
     }
 
     pub fn nested_object_numeric_detection(&self) -> bool {
-        self.nested_object_numeric_detection
+        self.internal().nested_object_numeric_detection
     }
 
-    pub fn nested_object_text_mapping(&self) -> &serde_json::Value {
-        &self.nested_object_text_mapping
+    pub fn nested_object_text_mapping(&self) -> serde_json::Value {
+        self.internal().nested_object_text_mapping()
     }
 
     pub fn include_source(&self) -> bool {
-        self.include_source
+        self.internal().include_source
     }
 }
 
@@ -448,11 +454,11 @@ impl ZDBIndexOptions {
     no_guard,
     sql = r#"
         -- we don't want any SQL generated for the "shadow" function, but we do want its '_wrapper' symbol
-        -- exported so that shadow indexes can reference it using whatever argument type they want    
+        -- exported so that shadow indexes can reference it using whatever argument type they want
     "#
 )]
 fn shadow(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
-    pg_getarg_datum_raw(fcinfo, 0)
+    unsafe { pg_getarg_datum_raw(fcinfo, 0) }
 }
 
 #[pg_extern(volatile, parallel_safe)]
@@ -529,28 +535,18 @@ pub(crate) fn index_options(index_relation: PgRelation) -> Option<Vec<String>> {
 #[pg_extern(volatile, parallel_safe)]
 fn index_field_lists(
     index_relation: PgRelation,
-) -> impl std::iter::Iterator<Item = (name!(fieldname, String), name!(fields, Vec<String>))> {
-    ZDBIndexOptions::from_relation(&index_relation)
-        .field_lists()
-        .into_iter()
-        .map(|(k, v)| (k, v.into_iter().map(|f| f.field_name()).collect()))
+) -> TableIterator<'static, (name!(fieldname, String), name!(fields, Vec<String>))> {
+    TableIterator::new(
+        ZDBIndexOptions::from_relation(&index_relation)
+            .field_lists()
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().map(|f| f.field_name()).collect())),
+    )
 }
 
 #[pg_extern(volatile, parallel_safe)]
 fn field_mapping(index_relation: PgRelation, field: &str) -> Option<JsonB> {
-    let root_index = IndexLink::from_relation(&index_relation);
-    let index_links = IndexLink::from_zdb(&index_relation);
-    let link = find_link_for_field(
-        &QualifiedField {
-            index: None,
-            field: field.into(),
-        },
-        &root_index,
-        &index_links,
-    );
-
-    link.map_or(None, |link| {
-        let index = link.open_index().expect("failed to open index");
+    fn extract_field_mapping(index: PgRelation, field: &str, full_mapping: bool) -> Option<JsonB> {
         let options = ZDBIndexOptions::from_relation(&index);
         let mapping = index_mapping(index);
 
@@ -563,6 +559,11 @@ fn field_mapping(index_relation: PgRelation, field: &str) -> Option<JsonB> {
                 .expect("no index object in mapping"),
         )
         .unwrap();
+
+        if full_mapping {
+            return as_map.remove("mappings").map(|v| JsonB(v));
+        }
+
         as_map = serde_json::from_value(
             as_map
                 .remove("mappings")
@@ -580,6 +581,45 @@ fn field_mapping(index_relation: PgRelation, field: &str) -> Option<JsonB> {
             Some(field_mapping) => Some(JsonB(field_mapping)),
             None => None,
         }
+    }
+
+    let root_index = IndexLink::from_relation(&index_relation);
+    let index_links = IndexLink::from_zdb(&index_relation);
+    let link = find_link_for_field(
+        &QualifiedField {
+            index: None,
+            field: field.into(),
+        },
+        &root_index,
+        &index_links,
+    );
+
+    link.map_or(None, |link| {
+        if link.name == Some(field.to_string()) {
+            // the link is named the same as the desired field, so the result is the entire ES mapping
+            // for the linked *index*
+            return extract_field_mapping(
+                link.open_index().expect("failed to open linked index"),
+                field,
+                true,
+            );
+        } else if link.name.is_some() && field.contains('.') {
+            // the link is a nested field, so lets see if it's the named link we found
+            let mut parts = field.split('.');
+            let base_fieldname = parts.next().unwrap();
+            let actual_field = parts.next().unwrap();
+            if link.name == Some(base_fieldname.to_string()) {
+                if let Some(field_mapping) = field_mapping(
+                    link.open_index().expect("failed to open linked index"),
+                    actual_field,
+                ) {
+                    return Some(field_mapping);
+                }
+            }
+        }
+
+        let index = link.open_index().expect("failed to open index");
+        extract_field_mapping(index, field, false)
     })
 }
 
@@ -825,7 +865,7 @@ pub unsafe extern "C" fn amoptions(
     build_relopts(reloptions, validate, tab)
 }
 
-#[cfg(any(feature = "pg13", feature = "pg14"))]
+#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
 unsafe fn build_relopts(
     reloptions: pg_sys::Datum,
     validate: bool,
@@ -846,7 +886,7 @@ unsafe fn build_relopts(
     rdopts as *mut pg_sys::bytea
 }
 
-#[cfg(any(feature = "pg10", feature = "pg11", feature = "pg12"))]
+#[cfg(any(feature = "pg12"))]
 unsafe fn build_relopts(
     reloptions: pg_sys::Datum,
     validate: bool,
@@ -890,7 +930,7 @@ pub unsafe fn init() {
         "Server URL and port".as_pg_cstr(),
         "default".as_pg_cstr(),
         Some(validate_url),
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -901,7 +941,7 @@ pub unsafe fn init() {
         "What Elasticsearch index type name should ZDB use?  Default is 'doc'".as_pg_cstr(),
         "doc".as_pg_cstr(),
         None,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -912,7 +952,7 @@ pub unsafe fn init() {
         "Frequency in which Elasticsearch indexes are refreshed.  Related to ES' index.refresh_interval setting".as_pg_cstr(),
         DEFAULT_REFRESH_INTERVAL.as_pg_cstr(),
         None,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
             { pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE },
     );
     pg_sys::add_int_reloption(
@@ -922,7 +962,7 @@ pub unsafe fn init() {
         DEFAULT_SHARDS,
         1,
         32768,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -934,7 +974,7 @@ pub unsafe fn init() {
         ZDB_DEFAULT_REPLICAS.get(),
         0,
         32768,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -946,7 +986,7 @@ pub unsafe fn init() {
         *DEFAULT_BULK_CONCURRENCY,
         1,
         num_cpus::get() as i32,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -958,7 +998,7 @@ pub unsafe fn init() {
         DEFAULT_BATCH_SIZE,
         1,
         (std::i32::MAX / 2) - 1,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -970,7 +1010,7 @@ pub unsafe fn init() {
         DEFAULT_COMPRESSION_LEVEL,
         0,
         9,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -983,7 +1023,7 @@ pub unsafe fn init() {
         DEFAULT_MAX_RESULT_WINDOW,
         1,
         std::i32::MAX,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -995,7 +1035,7 @@ pub unsafe fn init() {
         DEFAULT_NESTED_FIELDS_LIMIT,
         1,
         std::i32::MAX,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1007,7 +1047,7 @@ pub unsafe fn init() {
         DEFAULT_NESTED_OBJECTS_LIMIT,
         1,
         std::i32::MAX,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1019,7 +1059,7 @@ pub unsafe fn init() {
         DEFAULT_TOTAL_FIELDS_LIMIT,
         1,
         std::i32::MAX,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1032,7 +1072,7 @@ pub unsafe fn init() {
         DEFAULT_MAX_TERMS_COUNT,
         1,
         std::i32::MAX,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1045,7 +1085,7 @@ pub unsafe fn init() {
         DEFAULT_MAX_ANALYZE_TOKEN_COUNT,
         1,
         std::i32::MAX,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1056,7 +1096,7 @@ pub unsafe fn init() {
         "The Elasticsearch Alias to which this index should belong".as_pg_cstr(),
         std::ptr::null(),
         None,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1067,7 +1107,7 @@ pub unsafe fn init() {
         "The Elasticsearch index name, as a UUID".as_pg_cstr(),
         std::ptr::null(),
         None,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1078,7 +1118,7 @@ pub unsafe fn init() {
         "Elasticsearch index.translog.durability setting.  Defaults to 'request'".as_pg_cstr(),
         "request".as_pg_cstr(),
         Some(validate_translog_durability),
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1090,7 +1130,7 @@ pub unsafe fn init() {
         DEFAULT_OPTIMIZE_AFTER,
         0,
         std::i32::MAX,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1100,7 +1140,7 @@ pub unsafe fn init() {
         "llapi".as_pg_cstr(),
         "Will this index be used by ZomboDB's low-level API?".as_pg_cstr(),
         false,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1111,7 +1151,7 @@ pub unsafe fn init() {
         "ZomboDB Index Linking options".as_pg_cstr(),
         std::ptr::null(),
         Some(validate_options),
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1122,7 +1162,7 @@ pub unsafe fn init() {
         "Combine fields into named lists during search".as_pg_cstr(),
         std::ptr::null(),
         Some(validate_field_lists),
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1132,7 +1172,7 @@ pub unsafe fn init() {
         "shadow".as_pg_cstr(),
         "Is this index a shadow index, and if so, to which one".as_pg_cstr(),
         false,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1142,7 +1182,7 @@ pub unsafe fn init() {
         "nested_object_date_detection".as_pg_cstr(),
         "Should ES try to automatically detect dates in nested objects".as_pg_cstr(),
         false,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1152,7 +1192,7 @@ pub unsafe fn init() {
         "nested_object_numeric_detection".as_pg_cstr(),
         "Should ES try to automatically detect numbers in nested objects".as_pg_cstr(),
         false,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1163,7 +1203,7 @@ pub unsafe fn init() {
         "As a JSON mapping definition, how should dynamic text values in JSON be mapped?".as_pg_cstr(),
         r#"{ "type": "keyword", "ignore_above": 10922, "normalizer": "lowercase", "copy_to": "zdb_all" }"#.as_pg_cstr(),
         Some(validate_text_mapping),
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1173,7 +1213,7 @@ pub unsafe fn init() {
         "include_source".as_pg_cstr(),
         "Should the source of the document be included in the _source field?".as_pg_cstr(),
         true,
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
         {
             pg_sys::AccessExclusiveLock as pg_sys::LOCKMODE
         },
@@ -1181,7 +1221,7 @@ pub unsafe fn init() {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::access_method::options::{
         validate_translog_durability, validate_url, RefreshInterval, ZDBIndexOptions,
@@ -1190,8 +1230,8 @@ mod tests {
     };
     use crate::gucs::ZDB_DEFAULT_REPLICAS;
     use crate::zql::ast::IndexLink;
-    use pgx::pg_sys::AsPgCStr;
-    use pgx::*;
+    use pgrx::pg_sys::AsPgCStr;
+    use pgrx::*;
 
     #[pg_test]
     fn test_validate_url() {
@@ -1227,24 +1267,24 @@ mod tests {
 
     #[pg_test]
     #[initialize(es = true)]
-    unsafe fn test_index_options() {
+    unsafe fn test_index_options() -> spi::Result<()> {
         let uuid = 42424242;
         Spi::run(&format!(
-            "CREATE TABLE test();  
-        CREATE INDEX idxtest 
-                  ON test 
-               USING zombodb ((test.*)) 
-                WITH (url='http://localhost:19200/', 
-                      type_name='test_type_name', 
-                      alias='test_alias', 
-                      uuid='{}', 
+            "CREATE TABLE test();
+        CREATE INDEX idxtest
+                  ON test
+               USING zombodb ((test.*))
+                WITH (url='http://localhost:19200/',
+                      type_name='test_type_name',
+                      alias='test_alias',
+                      uuid='{}',
                       refresh_interval='5s',
                       translog_durability='async');",
             uuid
-        ));
+        ))?;
 
-        let index_oid = Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")
-            .expect("failed to get SPI result");
+        let index_oid =
+            Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")?.expect("oid was null");
         let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
         let options = ZDBIndexOptions::from_relation(&indexrel);
         assert_eq!(options.url(), "http://localhost:19200/");
@@ -1263,39 +1303,40 @@ mod tests {
         assert_eq!(options.optimize_after(), DEFAULT_OPTIMIZE_AFTER);
         assert_eq!(options.llapi(), false);
         assert_eq!(options.translog_durability(), "async");
-        assert_eq!(options.links, None);
+        assert_eq!(options.links(), &None);
+        Ok(())
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    unsafe fn test_index_options_defaults() {
+    unsafe fn test_index_options_defaults() -> spi::Result<()> {
         Spi::run(
-            "CREATE TABLE test();  
-        CREATE INDEX idxtest 
-                  ON test 
+            "CREATE TABLE test();
+        CREATE INDEX idxtest
+                  ON test
                USING zombodb ((test.*)) WITH (url='http://localhost:19200/');",
-        );
+        )?;
 
-        let heap_oid = Spi::get_one::<pg_sys::Oid>("SELECT 'test'::regclass::oid")
-            .expect("failed to get SPI result");
-        let index_oid = Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")
-            .expect("failed to get SPI result");
+        let heap_oid = Spi::get_one::<pg_sys::Oid>("SELECT 'test'::regclass::oid")?
+            .expect("SPI datum was NULL");
+        let index_oid = Spi::get_one::<pg_sys::Oid>("SELECT 'idxtest'::regclass::oid")?
+            .expect("SPI datum was NULL");
         let heaprel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(heap_oid));
         let indexrel = PgRelation::from_pg(pg_sys::RelationIdGetRelation(index_oid));
         let options = ZDBIndexOptions::from_relation(&indexrel);
         assert_eq!(options.type_name(), DEFAULT_TYPE_NAME);
         assert_eq!(
             &options.alias(),
-            &format!("pgx_tests.public.test.idxtest-{}", indexrel.oid())
+            &format!("pgrx_tests.public.test.idxtest-{}", indexrel.oid().as_u32())
         );
         assert_eq!(
             &options.uuid(),
             &format!(
                 "{}.{}.{}.{}",
-                pg_sys::MyDatabaseId,
-                indexrel.namespace_oid(),
-                heaprel.oid(),
-                indexrel.oid()
+                pg_sys::MyDatabaseId.as_u32(),
+                indexrel.namespace_oid().as_u32(),
+                heaprel.oid().as_u32(),
+                indexrel.oid().as_u32()
             )
         );
         assert_eq!(options.refresh_interval(), RefreshInterval::Immediate);
@@ -1306,66 +1347,70 @@ mod tests {
         assert_eq!(options.batch_size(), DEFAULT_BATCH_SIZE);
         assert_eq!(options.optimize_after(), DEFAULT_OPTIMIZE_AFTER);
         assert_eq!(options.llapi(), false);
-        assert_eq!(options.translog_durability(), "request")
+        assert_eq!(options.translog_durability(), "request");
+        Ok(())
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    unsafe fn test_index_name() {
+    unsafe fn test_index_name() -> spi::Result<()> {
         Spi::run(
-            "CREATE TABLE test();  
-        CREATE INDEX idxtest 
-                  ON test 
+            "CREATE TABLE test();
+        CREATE INDEX idxtest
+                  ON test
                USING zombodb ((test.*)) WITH (url='http://localhost:19200/');",
-        );
+        )?;
 
         let index_relation = PgRelation::open_with_name("idxtest").expect("no such relation");
         let options = ZDBIndexOptions::from_relation(&index_relation);
 
         assert_eq!(options.index_name(), options.uuid());
+        Ok(())
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    unsafe fn test_index_url() {
+    unsafe fn test_index_url() -> spi::Result<()> {
         Spi::run(
-            "CREATE TABLE test();  
-        CREATE INDEX idxtest 
-                  ON test 
+            "CREATE TABLE test();
+        CREATE INDEX idxtest
+                  ON test
                USING zombodb ((test.*)) WITH (url='http://localhost:19200/');",
-        );
+        )?;
 
         let index_relation = PgRelation::open_with_name("idxtest").expect("no such relation");
         let options = ZDBIndexOptions::from_relation(&index_relation);
 
         assert_eq!(options.url(), "http://localhost:19200/");
+        Ok(())
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    unsafe fn test_index_type_name() {
+    unsafe fn test_index_type_name() -> spi::Result<()> {
         Spi::run(
-            "CREATE TABLE test();  
-        CREATE INDEX idxtest 
-                  ON test 
+            "CREATE TABLE test();
+        CREATE INDEX idxtest
+                  ON test
                USING zombodb ((test.*)) WITH (url='http://localhost:19200/');",
-        );
+        )?;
 
         let index_relation = PgRelation::open_with_name("idxtest").expect("no such relation");
         let options = ZDBIndexOptions::from_relation(&index_relation);
 
         assert_eq!(options.type_name(), "doc");
+        Ok(())
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    unsafe fn test_index_link_options() {
+    unsafe fn test_index_link_options() -> spi::Result<()> {
         Spi::run(
-            "CREATE TABLE test_link_options();  
+            "CREATE TABLE test_link_options();
         CREATE INDEX idxtest_link_options
                   ON test_link_options
                USING zombodb ((test_link_options.*)) WITH (options='id=<schema.table.index>other_id');",
-        );
+        )?;
 
         let index_relation =
             PgRelation::open_with_name("idxtest_link_options").expect("no such relation");
@@ -1375,17 +1420,18 @@ mod tests {
             options.links(),
             &Some(vec!["id=<schema.table.index>other_id".to_string()])
         );
+        Ok(())
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    unsafe fn test_quoted_index_link_options_issue688() {
+    unsafe fn test_quoted_index_link_options_issue688() -> spi::Result<()> {
         Spi::run(
-            "CREATE TABLE test_link_options();  
+            "CREATE TABLE test_link_options();
         CREATE INDEX idxtest_link_options
                   ON test_link_options
                USING zombodb ((test_link_options.*)) WITH (options='id=<`schema.table.index`>other_id');",
-        );
+        )?;
 
         let index_relation =
             PgRelation::open_with_name("idxtest_link_options").expect("no such relation");
@@ -1396,6 +1442,7 @@ mod tests {
         let link_definition = links.first().unwrap();
         let link = IndexLink::parse(&link_definition);
         assert_eq!(link, IndexLink::parse("id=<schema.table.index>other_id"));
-        assert_eq!(link.qualified_index.schema, Some("schema".into()))
+        assert_eq!(link.qualified_index.schema, Some("schema".into()));
+        Ok(())
     }
 }

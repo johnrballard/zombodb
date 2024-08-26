@@ -1,4 +1,6 @@
-use crate::zql::ast::{Expr, ProximityTerm, QualifiedField, Term};
+use crate::utils::lookup_es_field_type;
+use crate::zql::ast::{Expr, ProximityPart, ProximityTerm, QualifiedField, Term};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub fn rewrite_proximity_chains(expr: &mut Expr) {
     match expr {
@@ -45,6 +47,31 @@ fn rewrite_term(field: &QualifiedField, term: &mut Term) {
                     .for_each(|prox_term| rewrite_prox_term(field, prox_term));
             }
         }
+        Term::Prefix(s, b) => {
+            let field_type = field
+                .index
+                .as_ref()
+                .map(|index_link| {
+                    let index = index_link.open_index()?;
+                    Ok::<_, &str>(lookup_es_field_type(&index, &field.field_name()))
+                })
+                .unwrap_or_else(|| Ok("zdb_standard".to_string()))
+                .unwrap_or_else(|_| "zdb_standard".to_string()); // we could panic here instead, but some of the test suite doesn't have access to the database, so just assume something
+
+            if field_type != "keyword" && s.unicode_words().count() > 1 {
+                match ProximityTerm::make_proximity_chain(field, s, *b) {
+                    ProximityTerm::ProximityChain(chain) => {
+                        *term = Term::ProximityChain(chain);
+                    }
+                    other => {
+                        *term = Term::ProximityChain(vec![ProximityPart {
+                            words: vec![other],
+                            distance: None,
+                        }])
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -68,6 +95,13 @@ fn rewrite_prox_term(field: &QualifiedField, prox_term: &mut ProximityTerm) {
         }
         ProximityTerm::Prefix(s, b) => {
             *prox_term = ProximityTerm::make_proximity_chain(field, &s, *b)
+        }
+        ProximityTerm::ProximityChain(v) => {
+            for part in v.iter_mut() {
+                for word in part.words.iter_mut() {
+                    rewrite_prox_term(field, word)
+                }
+            }
         }
         _ => {}
     }

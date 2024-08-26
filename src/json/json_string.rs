@@ -1,5 +1,9 @@
-use pgx::{Date, FromDatum, Json, JsonB, Time, TimeWithTimeZone, Timestamp, TimestampWithTimeZone};
+use pgrx::{Json, JsonB};
 use serde_json::json;
+
+use crate::misc::timestamp_support::{
+    ZDBDate, ZDBTime, ZDBTimeWithTimeZone, ZDBTimestamp, ZDBTimestampWithTimeZone,
+};
 
 pub trait JsonString: Send + Sync {
     fn push_json(&self, target: &mut Vec<u8>);
@@ -61,35 +65,35 @@ impl JsonString for bool {
     }
 }
 
-impl JsonString for Time {
+impl JsonString for ZDBTime {
     #[inline]
     fn push_json(&self, target: &mut Vec<u8>) {
         serde_json::to_writer(target, self).ok();
     }
 }
 
-impl JsonString for TimeWithTimeZone {
+impl JsonString for ZDBTimeWithTimeZone {
     #[inline]
     fn push_json(&self, target: &mut Vec<u8>) {
         serde_json::to_writer(target, self).ok();
     }
 }
 
-impl JsonString for Timestamp {
+impl JsonString for ZDBTimestamp {
     #[inline]
     fn push_json(&self, target: &mut Vec<u8>) {
         serde_json::to_writer(target, self).ok();
     }
 }
 
-impl JsonString for TimestampWithTimeZone {
+impl JsonString for ZDBTimestampWithTimeZone {
     #[inline]
     fn push_json(&self, target: &mut Vec<u8>) {
         serde_json::to_writer(target, self).ok();
     }
 }
 
-impl JsonString for Date {
+impl JsonString for ZDBDate {
     #[inline]
     fn push_json(&self, target: &mut Vec<u8>) {
         serde_json::to_writer(target, self).ok();
@@ -117,7 +121,7 @@ impl JsonString for String {
     }
 }
 
-impl JsonString for pgx::JsonString {
+impl JsonString for pgrx::JsonString {
     #[inline]
     fn push_json(&self, target: &mut Vec<u8>) {
         if self.0.contains('\r') || self.0.contains('\n') {
@@ -133,7 +137,7 @@ impl JsonString for pgx::JsonString {
 
 impl<T> JsonString for Vec<Option<T>>
 where
-    T: FromDatum + JsonString,
+    T: JsonString,
 {
     #[inline]
     fn push_json(&self, target: &mut Vec<u8>) {

@@ -5,7 +5,7 @@
 
 use crate::elasticsearch::aggregates::builders::make_children_map;
 use crate::elasticsearch::aggregates::terms::pg_catalog::TermsOrderBy;
-use pgx::*;
+use pgrx::*;
 use serde_json::*;
 
 #[pg_extern(immutable, parallel_safe)]
@@ -14,7 +14,7 @@ fn terms_agg(
     field: &str,
     size_limit: i32,
     order_by: TermsOrderBy,
-    children: Option<default!(Vec<JsonB>, NULL)>,
+    children: default!(Option<Vec<JsonB>>, NULL),
 ) -> JsonB {
     let order = match order_by {
         TermsOrderBy::count => json! {{ "_count": "asc" }},

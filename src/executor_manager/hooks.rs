@@ -5,7 +5,7 @@ use crate::executor_manager::alter::{
 use crate::executor_manager::drop::{drop_extension, drop_index, drop_schema, drop_table};
 use crate::executor_manager::get_executor_manager;
 use crate::walker::PlanWalker;
-use pgx::*;
+use pgrx::*;
 use std::ffi::CStr;
 
 struct ZDBHooks;
@@ -80,7 +80,9 @@ impl PgHooks for ZDBHooks {
                     completion_tag,
                 );
             }
-            let rel = unsafe { PgRelation::open(relid) };
+            let rel = unsafe {
+                PgRelation::with_lock(relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+            };
             let prev_options = get_index_options_for_relation(&rel);
             drop(rel);
 
@@ -112,22 +114,6 @@ impl PgHooks for ZDBHooks {
                 pg_sys::ObjectType_OBJECT_TABLE
                 | pg_sys::ObjectType_OBJECT_MATVIEW
                 | pg_sys::ObjectType_OBJECT_INDEX => unsafe {
-                    #[cfg(feature = "pg10")]
-                    let relid = pg_sys::RangeVarGetRelidExtended(
-                        rename.relation,
-                        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-                        true,
-                        false,
-                        None,
-                        std::ptr::null_mut(),
-                    );
-
-                    #[cfg(any(
-                        feature = "pg11",
-                        feature = "pg12",
-                        feature = "pg13",
-                        feature = "pg14"
-                    ))]
                     let relid = pg_sys::RangeVarGetRelidExtended(
                         rename.relation,
                         pg_sys::AccessShareLock as pg_sys::LOCKMODE,
@@ -137,7 +123,10 @@ impl PgHooks for ZDBHooks {
                     );
 
                     if relid != pg_sys::InvalidOid {
-                        let rel = PgRelation::open(relid);
+                        let rel = PgRelation::with_lock(
+                            relid,
+                            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                        );
                         Some(get_index_options_for_relation(&rel))
                     } else {
                         None

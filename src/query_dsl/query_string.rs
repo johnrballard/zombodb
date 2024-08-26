@@ -1,6 +1,6 @@
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
 
     #[allow(non_camel_case_types)]
@@ -11,11 +11,11 @@ mod pg_catalog {
     }
 }
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::query_dsl::query_string::pg_catalog::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -65,28 +65,28 @@ mod dsl {
     }
 
     #[pg_extern(immutable, parallel_safe)]
-    fn query_string(
-        query: &str,
-        default_field: Option<default!(&str, NULL)>,
-        allow_leading_wildcard: Option<default!(bool, NULL)>,
-        analyze_wildcard: Option<default!(bool, NULL)>,
-        analyzer: Option<default!(&str, NULL)>,
-        auto_generate_synonyms_phrase_query: Option<default!(bool, NULL)>,
-        boost: Option<default!(f32, NULL)>,
-        default_operator: Option<default!(QueryStringDefaultOperator, NULL)>,
-        enable_position_increments: Option<default!(bool, NULL)>,
-        fields: Option<default!(Array<&str>, NULL)>,
-        fuzziness: Option<default!(i32, NULL)>,
-        fuzzy_max_expansions: Option<default!(i64, NULL)>,
-        fuzzy_transpositions: Option<default!(bool, NULL)>,
-        fuzzy_prefix_length: Option<default!(i64, NULL)>,
-        lenient: Option<default!(bool, NULL)>,
-        max_determinized_states: Option<default!(i64, NULL)>,
-        minimum_should_match: Option<default!(i32, NULL)>,
-        quote_analyzer: Option<default!(&str, NULL)>,
-        phrase_slop: Option<default!(i64, NULL)>,
-        quote_field_suffix: Option<default!(&str, NULL)>,
-        time_zone: Option<default!(&str, NULL)>,
+    fn query_string<'a>(
+        query: &'a str,
+        default_field: default!(Option<&'a str>, NULL),
+        allow_leading_wildcard: default!(Option<bool>, NULL),
+        analyze_wildcard: default!(Option<bool>, NULL),
+        analyzer: default!(Option<&'a str>, NULL),
+        auto_generate_synonyms_phrase_query: default!(Option<bool>, NULL),
+        boost: default!(Option<f32>, NULL),
+        default_operator: default!(Option<QueryStringDefaultOperator>, NULL),
+        enable_position_increments: default!(Option<bool>, NULL),
+        fields: default!(Option<Array<'a, &'a str>>, NULL),
+        fuzziness: default!(Option<i32>, NULL),
+        fuzzy_max_expansions: default!(Option<i64>, NULL),
+        fuzzy_transpositions: default!(Option<bool>, NULL),
+        fuzzy_prefix_length: default!(Option<i64>, NULL),
+        lenient: default!(Option<bool>, NULL),
+        max_determinized_states: default!(Option<i64>, NULL),
+        minimum_should_match: default!(Option<i32>, NULL),
+        quote_analyzer: default!(Option<&'a str>, NULL),
+        phrase_slop: default!(Option<i64>, NULL),
+        quote_field_suffix: default!(Option<&'a str>, NULL),
+        time_zone: default!(Option<&'a str>, NULL),
     ) -> ZDBQuery {
         let querystring = QueryString {
             query,
@@ -122,10 +122,10 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::*;
 
     #[pg_test]
@@ -155,7 +155,8 @@ mod tests {
                 'time zoned'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -197,7 +198,8 @@ mod tests {
                 'query default string'
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(

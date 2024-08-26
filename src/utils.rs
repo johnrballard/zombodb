@@ -1,8 +1,8 @@
 use crate::access_method::options::ZDBIndexOptions;
 use crate::zql::ast::IndexLink;
 use byteorder::ReadBytesExt;
-use pgx::pg_sys::AsPgCStr;
-use pgx::*;
+use pgrx::pg_sys::AsPgCStr;
+use pgrx::*;
 use serde_json::Value;
 use std::io::Read;
 
@@ -11,10 +11,9 @@ pub fn count_non_shadow_zdb_indices(
     current_index: &PgRelation,
 ) -> usize {
     let mut cnt = 0;
-    for index in heap_relation.indicies(pg_sys::AccessShareLock as pg_sys::LOCKMODE) {
+    for index in heap_relation.indices(pg_sys::AccessShareLock as pg_sys::LOCKMODE) {
         if index.oid() != current_index.oid() && is_zdb_index(&index) {
-            let options = ZDBIndexOptions::from_relation_no_lookup(&index, None);
-            if !options.is_shadow_index() {
+            if !ZDBIndexOptions::is_shadow_index_fast(&index) {
                 cnt += 1;
             }
         }
@@ -58,8 +57,16 @@ fn get_heap_relation_from_var(
         )
     }
 
-    let rte = unsafe { PgBox::from_pg(pg_sys::rt_fetch(var.varno, view_def.rtable)) };
-    return PgRelation::with_lock(rte.relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+    use std::convert::TryInto;
+    let rte = unsafe {
+        PgBox::from_pg(pg_sys::rt_fetch(
+            var.varno.try_into().unwrap(),
+            view_def.rtable,
+        ))
+    };
+    return unsafe {
+        PgRelation::with_lock(rte.relid, pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+    };
 }
 
 pub fn find_zdb_index(
@@ -74,7 +81,7 @@ pub fn find_zdb_index(
             for index in any_relation
                 .heap_relation()
                 .expect("not an index")
-                .indicies(pg_sys::AccessShareLock as pg_sys::LOCKMODE)
+                .indices(pg_sys::AccessShareLock as pg_sys::LOCKMODE)
             {
                 if is_non_shadow_zdb_index(&index) {
                     return Ok((index, options.links().clone()));
@@ -88,6 +95,10 @@ pub fn find_zdb_index(
 
             for te in target_list.iter_ptr() {
                 let te = PgBox::from_pg(te);
+
+                if te.resname.is_null() {
+                    continue;
+                }
 
                 let resname = std::ffi::CStr::from_ptr(te.resname);
                 if resname.eq(std::ffi::CStr::from_bytes_with_nul_unchecked(ZDB_RESNAME)) {
@@ -114,10 +125,16 @@ pub fn find_zdb_index(
                 }
             }
         } else {
-            for index in any_relation.indicies(pg_sys::AccessShareLock as pg_sys::LOCKMODE) {
-                if is_non_shadow_zdb_index(&index) {
-                    return Ok((index.to_owned(), None));
-                }
+            let indices =
+                PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(any_relation.as_ptr()));
+            let zdb_index = indices
+                .iter_oid()
+                .filter(|oid| *oid != pg_sys::InvalidOid)
+                .map(|oid| PgRelation::with_lock(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE))
+                .find(|rel| is_non_shadow_zdb_index(rel));
+
+            if let Some(idx) = zdb_index {
+                return Ok((idx, None));
             }
         }
     }
@@ -130,10 +147,9 @@ pub fn find_zdb_index(
 
 fn find_zdb_shadow_index(table: &PgRelation, funcid: pg_sys::Oid) -> PgRelation {
     unsafe {
-        for index in table.indicies(pg_sys::AccessShareLock as pg_sys::LOCKMODE) {
+        for index in table.indices(pg_sys::AccessShareLock as pg_sys::LOCKMODE) {
             if is_zdb_index(&index) {
-                let options = ZDBIndexOptions::from_relation_no_lookup(&index, None);
-                if options.is_shadow_index() {
+                if ZDBIndexOptions::is_shadow_index_fast(&index) {
                     let exprs = PgList::<pg_sys::Expr>::from_pg(
                         pg_sys::RelationGetIndexExpressions(index.as_ptr()),
                     );
@@ -154,15 +170,12 @@ fn find_zdb_shadow_index(table: &PgRelation, funcid: pg_sys::Oid) -> PgRelation 
     panic!(
         "no matching ZomboDB shadow index on {} for function OID {}",
         table.name(),
-        funcid
+        funcid.as_u32()
     );
 }
 
 #[inline]
 pub fn is_zdb_index(index: &PgRelation) -> bool {
-    #[cfg(any(feature = "pg10", feature = "pg11"))]
-    let routine = index.rd_amroutine;
-    #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
     let routine = index.rd_indam;
 
     if routine.is_null() {
@@ -175,9 +188,6 @@ pub fn is_zdb_index(index: &PgRelation) -> bool {
 
 #[inline]
 pub fn is_non_shadow_zdb_index(index: &PgRelation) -> bool {
-    #[cfg(any(feature = "pg10", feature = "pg11"))]
-    let routine = index.rd_amroutine;
-    #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
     let routine = index.rd_indam;
 
     if routine.is_null() {
@@ -185,9 +195,7 @@ pub fn is_non_shadow_zdb_index(index: &PgRelation) -> bool {
     } else {
         let indam = unsafe { PgBox::from_pg(routine) };
         if indam.amvalidate == Some(crate::access_method::amvalidate) {
-            let options = ZDBIndexOptions::from_relation_no_lookup(index, None);
-
-            return !options.is_shadow_index();
+            return !ZDBIndexOptions::is_shadow_index_fast(index);
         }
 
         false
@@ -201,7 +209,9 @@ pub fn is_view(relation: &PgRelation) -> bool {
 }
 
 pub fn lookup_zdb_extension_oid() -> pg_sys::Oid {
-    match Spi::get_one::<pg_sys::Oid>("SELECT oid FROM pg_extension WHERE extname = 'zombodb';") {
+    match Spi::get_one::<pg_sys::Oid>("(SELECT oid FROM pg_extension WHERE extname = 'zombodb' UNION ALL SELECT 0) ORDER BY 1 DESC;")
+        .expect("SPI failed")
+    {
         Some(oid) => oid,
         None => panic!("no zombodb pg_extension entry.  Is ZomboDB installed?"),
     }
@@ -222,13 +232,15 @@ pub fn lookup_zdb_index_tupdesc(indexrel: &PgRelation) -> PgTupleDesc<'static> {
 
     // lookup the tuple descriptor for the rowtype we're *indexing*, rather than
     // using the tuple descriptor for the index definition itself
-    PgMemoryContexts::TopTransactionContext.switch_to(|_| unsafe {
-        PgTupleDesc::from_pg_is_copy(pg_sys::lookup_rowtype_tupdesc_copy(typid, typmod))
-    })
+    unsafe {
+        PgMemoryContexts::TopTransactionContext.switch_to(|_| {
+            PgTupleDesc::from_pg_is_copy(pg_sys::lookup_rowtype_tupdesc_copy(typid, typmod))
+        })
+    }
 }
 
 pub fn lookup_all_zdb_index_oids() -> Option<Vec<pg_sys::Oid>> {
-    Spi::get_one("select array_agg(oid) from pg_class where relkind = 'i' and relam = (select oid from pg_am where amname = 'zombodb');")
+    Spi::get_one("select array_agg(oid) from pg_class where relkind = 'i' and relam = (select oid from pg_am where amname = 'zombodb');").expect("SPI failed")
 }
 
 pub fn lookup_function(
@@ -275,6 +287,7 @@ pub fn get_search_analyzer(index: &PgRelation, field: &str) -> String {
             (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
         ],
     )
+    .expect("SPI failed")
     .expect("search analyzer was null")
 }
 
@@ -287,13 +300,27 @@ pub fn get_index_analyzer(index: &PgRelation, field: &str) -> String {
             (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
         ],
     )
+    .expect("SPI failed")
     .expect("search analyzer was null")
 }
 
-pub fn get_null_copy_to_fields(index: &PgRelation) -> Vec<String> {
-    let mut fields = Vec::new();
+pub fn get_highlight_analysis_info(
+    index: &PgRelation,
+    field: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    Spi::get_three_with_args(
+        "SELECT * FROM zdb.get_highlight_analysis_info($1, $2);",
+        vec![
+            (PgBuiltInOids::OIDOID.oid(), index.oid().into_datum()),
+            (PgBuiltInOids::TEXTOID.oid(), field.into_datum()),
+        ],
+    )
+    .expect("SPI failed")
+}
 
+pub fn get_null_copy_to_fields(index: &PgRelation) -> Vec<String> {
     Spi::connect(|client| {
+        let mut fields = Vec::new();
         let mut results = client.select(
             "select * from zdb.get_null_copy_to_fields($1);",
             None,
@@ -301,21 +328,41 @@ pub fn get_null_copy_to_fields(index: &PgRelation) -> Vec<String> {
                 PgBuiltInOids::OIDOID.oid(),
                 index.oid().into_datum(),
             )]),
-        );
+        )?;
 
         while results.next().is_some() {
-            fields.push(results.get_one().expect("field name was null"))
+            fields.push(results.get_one()?.expect("field name was null"))
         }
 
-        Ok(Some(()))
-    });
-
-    fields
+        Ok::<_, spi::Error>(fields)
+    })
+    .expect("SPI failed")
 }
 
 pub fn is_string_field(index: &PgRelation, field: &str) -> bool {
-    let field_type = lookup_es_field_type(index, field);
+    let field_type = if field.contains('.') {
+        match lookup_es_subfield_type(index, field).as_str() {
+            "" => lookup_es_nestedfield_type(index, field),
+            other => other.to_string(),
+        }
+    } else {
+        lookup_es_field_type(index, field)
+    };
+
     field_type == "text" || field_type == "keyword"
+}
+
+pub fn is_keyword_field(index: &PgRelation, field: &str) -> bool {
+    let field_type = if field.contains('.') {
+        match lookup_es_subfield_type(index, field).as_str() {
+            "" => lookup_es_nestedfield_type(index, field),
+            other => other.to_string(),
+        }
+    } else {
+        lookup_es_field_type(index, field)
+    };
+
+    field_type == "keyword"
 }
 
 pub fn is_date_field(index: &PgRelation, field: &str) -> bool {
@@ -323,11 +370,16 @@ pub fn is_date_field(index: &PgRelation, field: &str) -> bool {
 }
 
 pub fn is_date_subfield(index: &PgRelation, field: &str) -> bool {
-    lookup_es_subfield_type(index, field) == "date"
+    lookup_es_subfield_type(index, &format!("{field}.date")) == "date"
 }
 
-pub fn is_nested_field(index: &PgRelation, field: &str) -> bool {
-    lookup_es_field_type(index, field) == "nested"
+pub fn is_nested_field(index: &PgRelation, field: &str) -> Option<bool> {
+    let field_type = lookup_es_field_type(index, field);
+    if field_type.is_empty() {
+        None
+    } else {
+        Some(field_type == "nested")
+    }
 }
 
 pub fn is_named_index_link(index: &PgRelation, name: &str) -> bool {
@@ -352,8 +404,8 @@ pub fn lookup_es_field_type(index: &PgRelation, field: &str) -> String {
     sql.push_str(&format!(
         "select
         zdb.index_mapping({}::regclass)->zdb.index_name({}::regclass)->'mappings'->'properties'",
-        index.oid(),
-        index.oid()
+        index.oid().as_u32(),
+        index.oid().as_u32()
     ));
 
     for (idx, part) in field.split('.').enumerate() {
@@ -368,7 +420,7 @@ pub fn lookup_es_field_type(index: &PgRelation, field: &str) -> String {
     }
 
     sql.push_str("->>'type';");
-    Spi::get_one(&sql).unwrap_or_default()
+    Spi::get_one(&sql).expect("SPI failed").unwrap_or_default()
 }
 
 pub fn lookup_es_subfield_type(index: &PgRelation, field: &str) -> String {
@@ -377,8 +429,33 @@ pub fn lookup_es_subfield_type(index: &PgRelation, field: &str) -> String {
     sql.push_str(&format!(
         "select
         zdb.index_mapping({}::regclass)->zdb.index_name({}::regclass)->'mappings'->'properties'",
-        index.oid(),
-        index.oid()
+        index.oid().as_u32(),
+        index.oid().as_u32()
+    ));
+
+    for (idx, part) in field.split('.').enumerate() {
+        if idx > 0 {
+            sql.push_str("->'fields'");
+        }
+
+        sql.push_str("->");
+        sql.push('\'');
+        sql.push_str(part);
+        sql.push('\'');
+    }
+
+    sql.push_str("->>'type';");
+    Spi::get_one(&sql).expect("SPI failed").unwrap_or_default()
+}
+
+pub fn lookup_es_nestedfield_type(index: &PgRelation, field: &str) -> String {
+    let mut sql = String::new();
+
+    sql.push_str(&format!(
+        "select
+        zdb.index_mapping({}::regclass)->zdb.index_name({}::regclass)->'mappings'->'properties'",
+        index.oid().as_u32(),
+        index.oid().as_u32()
     ));
 
     for (idx, part) in field.split('.').enumerate() {
@@ -392,9 +469,21 @@ pub fn lookup_es_subfield_type(index: &PgRelation, field: &str) -> String {
         sql.push('\'');
     }
 
-    sql.push_str("->'fields'->'date'");
     sql.push_str("->>'type';");
-    Spi::get_one(&sql).unwrap_or_default()
+    Spi::get_one(&sql).expect("SPI failed").unwrap_or_default()
+}
+
+pub fn has_date_subfield(index: &PgRelation, field: &str) -> bool {
+    let mut sql = String::new();
+
+    sql.push_str(&format!(
+        "select
+        zdb.index_mapping({}::regclass)->zdb.index_name({}::regclass)->'mappings'->'properties'->'{field}'->'fields'->'date'->>'type' = 'date'",
+        index.oid().as_u32(),
+        index.oid().as_u32()
+    ));
+
+    Spi::get_one(&sql).expect("SPI failed").unwrap_or_default()
 }
 
 pub fn json_to_string(key: serde_json::Value) -> Option<String> {
@@ -415,7 +504,8 @@ pub fn type_is_domain(typoid: pg_sys::Oid) -> Option<(pg_sys::Oid, String)> {
     let (is_domain, base_type, name) = Spi::get_three_with_args::<bool, pg_sys::Oid, String>(
         "SELECT typtype = 'd', typbasetype, typname::text FROM pg_type WHERE oid = $1",
         vec![(PgBuiltInOids::OIDOID.oid(), typoid.into_datum())],
-    );
+    )
+    .expect("SPI failed");
 
     if is_domain.unwrap_or(false) {
         Some((base_type.unwrap(), name.unwrap()))

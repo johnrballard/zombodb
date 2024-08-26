@@ -3,11 +3,10 @@ use std::fmt::{Debug, Display, Error, Formatter};
 use std::str::FromStr;
 
 use lalrpop_util::ParseError;
-use pgx::PgRelation;
+use pgrx::PgRelation;
 use serde::{Deserialize, Serialize};
 
-pub use pg_catalog::ProximityPart;
-pub use pg_catalog::ProximityTerm;
+pub use pg_catalog::{ProximityPart, ProximityTerm};
 
 use crate::access_method::options::ZDBIndexOptions;
 use crate::utils::{find_zdb_index, get_null_copy_to_fields};
@@ -18,8 +17,10 @@ use crate::zql::transformations::expand_index_links::expand_index_links;
 use crate::zql::transformations::field_finder::{find_fields, find_link_for_field};
 use crate::zql::transformations::field_lists::expand_field_lists;
 use crate::zql::transformations::index_links::assign_links;
+use crate::zql::transformations::merge_index_links::merge_adjacent_links;
 use crate::zql::transformations::nested_groups::group_nested;
 use crate::zql::transformations::prox_rewriter::rewrite_proximity_chains;
+use crate::zql::transformations::pullup::pullup_and;
 use crate::zql::{INDEX_LINK_PARSER, ZDB_QUERY_PARSER};
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,9 +38,9 @@ impl Default for ProximityDistance {
     }
 }
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 pub mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::{Deserialize, Serialize};
 
     use crate::zql::ast::ProximityDistance;
@@ -69,7 +70,7 @@ pub struct QualifiedIndex {
     pub index: String,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct QualifiedField {
     pub index: Option<IndexLink>,
     pub field: String,
@@ -127,6 +128,7 @@ pub enum ComparisonOpcode {
 pub enum Term<'input> {
     Null,
     MatchAll,
+    MatchNone,
     String(&'input str, Option<f32>),
     Phrase(&'input str, Option<f32>),
     Prefix(&'input str, Option<f32>),
@@ -385,7 +387,15 @@ impl ProximityTerm {
 
                     for token in tokens {
                         let token = ProximityTerm::replace_substitutions(&token);
-                        let term = Term::maybe_make_wildcard_or_regex(None, &token, b);
+                        let mut term = Term::maybe_make_wildcard_or_regex(None, &token, b);
+
+                        // we wouldn't expect Term::maybe_make_wildcard_or_regex() to return a phrase
+                        // as its input token has already been run through Elasticsearch's analysis
+                        // and we're dealing with individual tokens, even if the tokens might otherwise
+                        // look like a phrase to us
+                        if let Term::Phrase(s, b) = term {
+                            term = Term::String(s, b);
+                        }
                         terms.push(ProximityTerm::from_term(&term));
                     }
 
@@ -408,7 +418,7 @@ impl ProximityTerm {
                 // the current part's distance for each consecutive '*' we find
                 while next.is_some() {
                     let current_distance = part.distance.as_mut().unwrap().distance;
-                    pgx::check_for_interrupts!();
+                    pgrx::check_for_interrupts!();
 
                     let unwrapped = next.unwrap();
                     if unwrapped.words.len() == 1 {
@@ -506,11 +516,13 @@ impl<'input> Expr<'input> {
                 for (link, relation) in index
                     .into_iter()
                     .map(|index| (&root_index, index.clone()))
-                    .chain(
-                        index_links
-                            .iter()
-                            .map(|link| (link, link.open_index().expect("failed to open index"))),
-                    )
+                    .chain(index_links.iter().map(|link| {
+                        (
+                            link,
+                            link.open_index()
+                                .expect(&format!("failed to open index for {:?}", link)),
+                        )
+                    }))
                 {
                     let fields = get_null_copy_to_fields(&relation);
                     field_lists.entry("zdb_all".into()).or_default().append(
@@ -550,14 +562,17 @@ impl<'input> Expr<'input> {
                 link.right_field.as_ref().unwrap(),
             )
         }
+        let original_index = &root_index;
         let root_index = if let Some(link) = target_link {
             link
         } else {
             &root_index
         };
 
-        assign_links(&root_index, &mut expr, index_links);
+        pullup_and(&mut expr);
+        assign_links(original_index, &root_index, &mut expr, index_links);
         expand_index_links(&mut expr, &root_index, &mut relationship_manager);
+        merge_adjacent_links(&mut expr);
         rewrite_proximity_chains(&mut expr);
         Ok(expr)
     }
@@ -681,6 +696,10 @@ impl<'input> Expr<'input> {
             Expr::FuzzyLikeThis(f, _) => f.nested_path(),
             Expr::Matches(f, _) => f.nested_path(),
         }
+    }
+
+    pub fn is_linked(&self) -> bool {
+        matches!(self, Expr::Linked(_, _))
     }
 }
 
@@ -855,6 +874,17 @@ impl IndexLink {
             field: self.left_field.as_ref().unwrap().clone(),
         }
     }
+
+    pub fn contains_field(&self, field_name: &str) -> std::result::Result<bool, &str> {
+        let relation = self.open_index()?;
+        for att in relation.tuple_desc().iter() {
+            if att.name() == field_name {
+                // the table behind this index link contains this field
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 impl QualifiedField {
@@ -952,6 +982,7 @@ impl<'input> Display for Term<'input> {
             Term::Null => write!(fmt, "NULL"),
 
             Term::MatchAll => write!(fmt, "*"),
+            Term::MatchNone => write!(fmt, "[]"),
 
             Term::String(s, b)
             | Term::Phrase(s, b)

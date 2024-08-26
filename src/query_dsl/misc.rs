@@ -3,9 +3,9 @@
 //!
 //!Returns documents that contain terms matching a wildcard pattern.
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod pg_catalog {
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
 
     #[allow(non_camel_case_types)]
@@ -19,11 +19,11 @@ mod pg_catalog {
     }
 }
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::query_dsl::misc::pg_catalog::RegexFlags;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -64,9 +64,9 @@ mod dsl {
     pub(crate) fn regexp(
         field: &str,
         regexp: &str,
-        boost: Option<default!(f32, NULL)>,
-        flags: Option<default!(Array<RegexFlags>, NULL)>,
-        max_determinized_states: Option<default!(i32, NULL)>,
+        boost: default!(Option<f32>, NULL),
+        flags: default!(Option<Array<RegexFlags>>, NULL),
+        max_determinized_states: default!(Option<i32>, NULL),
     ) -> ZDBQuery {
         let regexp = Regexp {
             regexp,
@@ -86,7 +86,7 @@ mod dsl {
     #[pg_extern(immutable, parallel_safe)]
     pub(crate) fn script(
         source: &str,
-        params: Option<default!(Json, NULL)>,
+        params: default!(Option<Json>, NULL),
         lang: default!(&str, "'painless'"),
     ) -> ZDBQuery {
         let script = Script {
@@ -105,11 +105,11 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::query_dsl::misc::dsl::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::*;
 
     #[pg_test]
@@ -130,7 +130,8 @@ mod tests {
     #[pg_test]
     fn test_wildcard_with_default() {
         let zdbquery = Spi::get_one::<ZDBQuery>("SELECT dsl.wildcard('fieldname', 't*t');")
-            .expect("didn't get SPI return value");
+            .expect("SPI failed")
+            .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -178,7 +179,8 @@ mod tests {
                 32
             )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
         let dsl = zdbquery.into_value();
 
         assert_eq!(
@@ -220,8 +222,9 @@ mod tests {
 
     #[pg_test]
     fn test_script_without_default() {
-        let json_example =
-            Spi::get_one::<Json>(r#"  SELECT '{"json": "json_value"}'::json;  "#).unwrap();
+        let json_example = Spi::get_one::<Json>(r#"  SELECT '{"json": "json_value"}'::json;  "#)
+            .expect("SPI failed")
+            .unwrap();
         let zdbquery = script("script_source", Some(json_example), "totally_a_lang");
         let dsl = zdbquery.into_value();
 

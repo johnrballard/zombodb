@@ -1,4 +1,4 @@
-use pgx::*;
+use pgrx::*;
 
 #[pg_guard(immutable, parallel_safe)]
 pub unsafe extern "C" fn amcostestimate(
@@ -13,7 +13,12 @@ pub unsafe extern "C" fn amcostestimate(
 ) {
     let path = path.as_ref().expect("path argument is NULL");
     let indexinfo = path.indexinfo.as_ref().expect("indexinfo in path is NULL");
-    let index_relation = PgRelation::open(indexinfo.indexoid);
+    let index_relation = unsafe {
+        PgRelation::with_lock(
+            indexinfo.indexoid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        )
+    };
     let heap_relation = index_relation
         .heap_relation()
         .expect("failed to get heap relation for index");
@@ -27,17 +32,9 @@ pub unsafe extern "C" fn amcostestimate(
     // these would have been calculated in zdb_restrict()
     *index_selectivity = 1.0;
 
-    #[cfg(any(feature = "pg10", feature = "pg11"))]
-    let index_clauses = PgList::<pg_sys::RestrictInfo>::from_pg(path.indexclauses);
-
-    #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
     let index_clauses = PgList::<pg_sys::IndexClause>::from_pg(path.indexclauses);
 
     for clause in index_clauses.iter_ptr() {
-        #[cfg(any(feature = "pg10", feature = "pg11"))]
-        let ri = clause.as_ref().expect("restrict info is NULL");
-
-        #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
         let ri = clause
             .as_ref()
             .unwrap()

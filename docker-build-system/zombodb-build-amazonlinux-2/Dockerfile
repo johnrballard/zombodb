@@ -1,5 +1,5 @@
 #
-# Copyright 2018-2022 ZomboDB, LLC
+# Copyright 2018-2023 ZomboDB, LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,18 +33,6 @@ RUN yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.n
 RUN yum install -y clang llvm5.0-devel openssl-devel
 
 RUN echo $'\n\
-[pgdg10]\n\
-name=PostgreSQL 10 for RHEL/CentOS 7 - x86_64\n\
-baseurl=https://download.postgresql.org/pub/repos/yum/10/redhat/rhel-7-x86_64\n\
-enabled=1\n\
-gpgcheck=0\n\
-\n\
-[pgdg11]\n\
-name=PostgreSQL 11 for RHEL/CentOS 7 - x86_64\n\
-baseurl=https://download.postgresql.org/pub/repos/yum/11/redhat/rhel-7-x86_64\n\
-enabled=1\n\
-gpgcheck=0\n\
-\n\
 [pgdg12]\n\
 name=PostgreSQL 12 for RHEL/CentOS 7 - x86_64\n\
 baseurl=https://download.postgresql.org/pub/repos/yum/12/redhat/rhel-7-x86_64\n\
@@ -62,16 +50,20 @@ name=PostgreSQL 14 for RHEL/CentOS 7 - x86_64\n\
 baseurl=https://download.postgresql.org/pub/repos/yum/14/redhat/rhel-7-x86_64\n\
 enabled=1\n\
 gpgcheck=0\n\
+[pgdg15]\n\
+name=PostgreSQL 15 for RHEL/CentOS 7 - x86_64\n\
+baseurl=https://download.postgresql.org/pub/repos/yum/15/redhat/rhel-7-x86_64\n\
+enabled=1\n\
+gpgcheck=0\n\
 ' >> /etc/yum.repos.d/pgdg.repo
 
 
 RUN yum install -y http://mirror.centos.org/centos/7/extras/x86_64/Packages/centos-release-scl-rh-2-3.el7.centos.noarch.rpm
 RUN yum install -y llvm-toolset-7-clang
-RUN yum install -y postgresql10 postgresql10-server postgresql10-devel
-RUN yum install -y postgresql11 postgresql11-server postgresql11-devel
 RUN yum install -y postgresql12 postgresql12-server postgresql12-devel
 RUN yum install -y postgresql13 postgresql13-server postgresql13-devel
 RUN yum install -y postgresql14 postgresql14-server postgresql14-devel
+RUN yum install -y postgresql15 postgresql15-server postgresql15-devel
 
 USER ${UID}:${GID}
 WORKDIR /home/${USER}
@@ -81,16 +73,17 @@ RUN curl -sSL https://rvm.io/mpapis.asc | gpg2 --import -
 RUN curl -sSL https://rvm.io/pkuczynski.asc | gpg2 --import -
 RUN curl -sSL https://get.rvm.io | bash -s stable
 RUN /bin/bash -l -c ". ~/.rvm/scripts/rvm && rvm install 2.3.3"
+RUN /bin/bash -l -c ". ~/.rvm/scripts/rvm && gem install --no-document rexml -v 3.2.5"
+RUN /bin/bash -l -c ". ~/.rvm/scripts/rvm && gem install --no-document dotenv -v 2.8.1"
 RUN /bin/bash -l -c ". ~/.rvm/scripts/rvm && gem install --no-document fpm"
 
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
 ENV PATH="/home/${USER}/.cargo/bin:${PATH}"
 
-RUN cargo install cargo-pgx
-RUN cargo pgx init \
-	--pg10=/usr/pgsql-10/bin/pg_config \
-	--pg11=/usr/pgsql-11/bin/pg_config \
+RUN cargo install cargo-pgrx
+RUN cargo pgrx init \
 	--pg12=/usr/pgsql-12/bin/pg_config \
 	--pg13=/usr/pgsql-13/bin/pg_config \
-	--pg14=/usr/pgsql-14/bin/pg_config
+	--pg14=/usr/pgsql-14/bin/pg_config \
+	--pg15=/usr/pgsql-15/bin/pg_config

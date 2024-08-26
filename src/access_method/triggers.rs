@@ -1,6 +1,6 @@
 use crate::executor_manager::get_executor_manager;
-use pgx::pg_sys::{AsPgCStr, MaxOffsetNumber};
-use pgx::*;
+use pgrx::pg_sys::{AsPgCStr, MaxOffsetNumber};
+use pgrx::*;
 use std::ffi::CStr;
 
 #[pg_extern(sql = "
@@ -34,14 +34,15 @@ fn zdb_update_trigger(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
         let index_relid_str = CStr::from_ptr(args[0] as *const std::os::raw::c_char)
             .to_str()
             .unwrap();
-        let index_relid = str::parse::<pg_sys::Oid>(index_relid_str).expect("malformed oid");
+        let index_relid = str::parse::<u32>(index_relid_str).expect("malformed oid");
+        let index_relid = pg_sys::Oid::from_u32_unchecked(index_relid);
         let mut tid = (*trigdata.tg_trigtuple).t_self;
 
         maybe_find_hot_root(&trigdata, &mut tid);
 
         let bulk = get_executor_manager().checkout_bulk_context(index_relid);
         if !bulk.is_shadow {
-            bulk.bulk
+            bulk.es_bulk_request
                 .update(
                     tid,
                     pg_sys::GetCurrentCommandId(true),
@@ -50,7 +51,7 @@ fn zdb_update_trigger(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
                 .expect("failed to queue index update command");
         }
 
-        trigdata.tg_newtuple as pg_sys::Datum
+        trigdata.tg_newtuple.into()
     }
 }
 
@@ -85,14 +86,15 @@ fn zdb_delete_trigger(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
         let index_relid_str = CStr::from_ptr(args[0] as *const std::os::raw::c_char)
             .to_str()
             .unwrap();
-        let index_relid = str::parse::<pg_sys::Oid>(index_relid_str).expect("malformed oid");
+        let index_relid = str::parse::<u32>(index_relid_str).expect("malformed oid");
+        let index_relid = pg_sys::Oid::from_u32_unchecked(index_relid);
         let mut tid = (*trigdata.tg_trigtuple).t_self;
 
         maybe_find_hot_root(&trigdata, &mut tid);
 
         let bulk = get_executor_manager().checkout_bulk_context(index_relid);
         if !bulk.is_shadow {
-            bulk.bulk
+            bulk.es_bulk_request
                 .delete(
                     tid,
                     pg_sys::GetCurrentCommandId(true),
@@ -101,7 +103,7 @@ fn zdb_delete_trigger(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum {
                 .expect("failed to queue index delete command");
         }
 
-        trigdata.tg_trigtuple as pg_sys::Datum
+        trigdata.tg_trigtuple.into()
     }
 }
 
@@ -112,22 +114,21 @@ unsafe fn maybe_find_hot_root(
 ) {
     if pg_sys::HeapTupleHeaderIsHeapOnly((*trigdata.tg_trigtuple).t_data) {
         let mut buf = 0 as pg_sys::Buffer;
-        #[cfg(any(feature = "pg10", feature = "pg11"))]
-        let found_tuple = pg_sys::heap_fetch(
-            (*trigdata).tg_relation,
-            pg_sys::GetTransactionSnapshot(),
-            trigdata.tg_trigtuple,
-            &mut buf,
-            false,
-            std::ptr::null_mut(),
-        );
-
         #[cfg(any(feature = "pg12", feature = "pg13", feature = "pg14"))]
         let found_tuple = pg_sys::heap_fetch(
             (*trigdata).tg_relation,
             pg_sys::GetTransactionSnapshot(),
             trigdata.tg_trigtuple,
             &mut buf,
+        );
+
+        #[cfg(any(feature = "pg15"))]
+        let found_tuple = pg_sys::heap_fetch(
+            (*trigdata).tg_relation,
+            pg_sys::GetTransactionSnapshot(),
+            trigdata.tg_trigtuple,
+            &mut buf,
+            false,
         );
 
         if found_tuple {
@@ -165,8 +166,10 @@ fn trigger_exists(index_relation: &PgRelation, trigger_name: &str) -> bool {
     let heap_oid = index_relation.heap_relation().unwrap().oid();
     Spi::get_one::<bool>(&format!(
         "SELECT count(*) > 0 FROM pg_trigger WHERE tgrelid = {} AND tgname LIKE '{}%'",
-        heap_oid, trigger_name
+        heap_oid.as_u32(),
+        trigger_name
     ))
+    .expect("SPI failed")
     .expect("failed to determine if trigger already exists")
 }
 
@@ -207,7 +210,8 @@ fn create_trigger(
     let mut args = PgList::new();
     let mut funcname = PgList::new();
 
-    let trigger_arg_string = unsafe { pg_sys::makeString(trigger_arg.to_string().as_pg_cstr()) };
+    let trigger_arg_string =
+        unsafe { pg_sys::makeString(trigger_arg.as_u32().to_string().as_pg_cstr()) };
 
     args.push(trigger_arg_string);
 
@@ -218,8 +222,9 @@ fn create_trigger(
         funcname.push(pg_sys::makeString(function_name.as_pg_cstr()));
     }
 
-    let mut tgstmt = PgBox::<pg_sys::CreateTrigStmt>::alloc_node(pg_sys::NodeTag_T_CreateTrigStmt);
-    tgstmt.trigname = PgMemoryContexts::CurrentMemoryContext.pstrdup(trigger_name);
+    let mut tgstmt =
+        unsafe { PgBox::<pg_sys::CreateTrigStmt>::alloc_node(pg_sys::NodeTag_T_CreateTrigStmt) };
+    tgstmt.trigname = unsafe { PgMemoryContexts::CurrentMemoryContext.pstrdup(trigger_name) };
     tgstmt.relation = relrv;
     tgstmt.funcname = funcname.into_pg();
     tgstmt.args = args.into_pg();

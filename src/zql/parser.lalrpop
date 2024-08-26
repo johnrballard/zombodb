@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::collections::HashSet;
 use crate::zql::ast::*;
 use std::collections::HashMap;
-use pgx::*;
+use pgrx::*;
 
 grammar(source_index: Option<&PgRelation>, used_fields: &mut HashSet<&'input str>, fieldname_stack: &mut Vec<&'input str>, operator_stack: &mut Vec<ComparisonOpcode>);
 
@@ -275,8 +275,20 @@ ComparisonOp: ComparisonOpcode = {
 
 Term: Term<'input> = {
     StringExpr => <>,
-    O_BRACKET <v:(<StringExpr> COMMA?)*> C_BRACKET <b:Boost?> => Term::ParsedArray(v, b),
-    <a:UnparsedArray> <b:Boost?> => Term::UnparsedArray(a, b),
+    O_BRACKET <v:(<StringExpr> COMMA?)*> C_BRACKET <b:Boost?> => {
+        if v.is_empty() {
+            Term::MatchNone
+        } else {
+            Term::ParsedArray(v, b)
+        }
+    },
+    <a:UnparsedArray> <b:Boost?> => {
+        if a.trim().is_empty() {
+            Term::MatchNone
+        } else {
+            Term::UnparsedArray(a, b)
+        }
+    },
 };
 
 UnparsedArray: &'input str = {

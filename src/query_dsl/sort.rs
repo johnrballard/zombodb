@@ -3,18 +3,18 @@
 //!
 //! Allows you to add one or more sorts on specific fields. Each sort can be reversed as well.
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod dsl {
     use crate::zdbquery::{
         SortDescriptor, SortDescriptorOptions, SortDirection, SortMode, ZDBQuery,
     };
-    use pgx::*;
+    use pgrx::*;
 
     #[pg_extern(immutable, parallel_safe)]
     fn sd(
         field: &str,
         order: SortDirection,
-        mode: Option<default!(SortMode, NULL)>,
+        mode: default!(Option<SortMode>, NULL),
     ) -> SortDescriptor {
         SortDescriptor {
             field: field.to_string(),
@@ -32,8 +32,8 @@ mod dsl {
         field: &str,
         order: SortDirection,
         nested_path: &str,
-        nested_filter: Option<default!(ZDBQuery, NULL)>,
-        mode: Option<default!(SortMode, NULL)>,
+        nested_filter: default!(Option<ZDBQuery>, NULL),
+        mode: default!(Option<SortMode>, NULL),
     ) -> SortDescriptor {
         let nested_filter = match nested_filter {
             Some(query) => Some(query.query_dsl()),
@@ -75,16 +75,17 @@ mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::*;
 
     #[pg_test]
     fn test_sort() {
         let zdbquery = Spi::get_one::<ZDBQuery>("SELECT dsl.sort('the_field', 'asc', 'david')")
-            .expect("failed to get SPI result");
+            .expect("SPI failed")
+            .expect("SPI datum was NULL");
 
         assert_eq!(
             &serde_json::to_value(&zdbquery).unwrap(),
@@ -101,7 +102,8 @@ mod tests {
     fn test_sort_direct() {
         let zdbquery =
             Spi::get_one::<ZDBQuery>("SELECT dsl.sort_direct('{\"foo\": \"bar\"}', 'david')")
-                .expect("failed to get SPI result");
+                .expect("SPI failed")
+                .expect("SPI datum was NULL");
 
         assert_eq!(
             &serde_json::to_value(&zdbquery).unwrap(),
@@ -117,13 +119,14 @@ mod tests {
     #[pg_test]
     fn test_sort_sd_and_sort_many() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
-            "SELECT dsl.sort_many('query', 
+            "SELECT dsl.sort_many('query',
                 dsl.sd('cat','asc','max'),
                 dsl.sd('dog','asc','min'),
                 dsl.sd('foo','desc','sum')
              )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
 
         assert_eq!(
             &serde_json::to_value(&zdbquery).unwrap(),
@@ -143,13 +146,14 @@ mod tests {
     #[pg_test]
     fn test_sort_sd_nested_and_sort_many() {
         let zdbquery = Spi::get_one::<ZDBQuery>(
-            "SELECT dsl.sort_many('query', 
+            "SELECT dsl.sort_many('query',
                 dsl.sd_nested('cat', 'asc', 'a_path', dsl.term('fieldname','filter'), 'max'),
                 dsl.sd_nested('dog', 'asc', 'a_path', dsl.term('fieldname','filter'), 'min'),
                 dsl.sd_nested('foo', 'desc', 'a_path', dsl.term('fieldname','filter'), 'sum')
              )",
         )
-        .expect("failed to get SPI result");
+        .expect("SPI failed")
+        .expect("SPI datum was NULL");
 
         assert_eq!(
             &serde_json::to_value(&zdbquery).unwrap(),

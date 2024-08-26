@@ -4,10 +4,10 @@
 //!Terms lookup fetches the field values of an existing document.
 //! Elasticsearch then uses those values as search terms. This can be helpful when searching for a large set of terms.
 
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 pub mod dsl {
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde::*;
     use serde_json::*;
 
@@ -26,7 +26,7 @@ pub mod dsl {
         index: &str,
         id: &str,
         path: &str,
-        routing: Option<default!(&str, NULL)>,
+        routing: default!(Option<&str>, NULL),
     ) -> ZDBQuery {
         let terms_lookup_object = TermsLookup {
             index,
@@ -46,11 +46,11 @@ pub mod dsl {
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::query_dsl::terms_lookup::dsl::*;
     use crate::zdbquery::ZDBQuery;
-    use pgx::*;
+    use pgrx::*;
     use serde_json::json;
 
     #[pg_test]
@@ -99,7 +99,8 @@ mod tests {
     fn test_terms_lookup_with_default_routing() {
         let zdbquery =
             Spi::get_one::<ZDBQuery>("SELECT dsl.terms_lookup('field', 'index', 'id', 'path')")
-                .expect("failed to get SPI result");
+                .expect("SPI failed")
+                .expect("SPI datum was NULL");
 
         let dsl = zdbquery.into_value();
 

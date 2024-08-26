@@ -1,21 +1,23 @@
-use crate::elasticsearch::analyze::Token;
 use crate::elasticsearch::Elasticsearch;
-use crate::zql::ast::{IndexLink, ProximityPart, QualifiedField};
-use crate::zql::ast::{ProximityTerm, Term};
+use crate::highlighting::analyze::AnalyzedToken;
+use crate::utils::{get_highlight_analysis_info, has_date_subfield};
+use crate::zql::ast::{IndexLink, ProximityPart, ProximityTerm, QualifiedField, Term};
 use levenshtein::*;
-use pgx::PgRelation;
-use pgx::*;
+use pgrx::pg_sys::{AsPgCStr, InvalidOid};
+use pgrx::prelude::*;
+use pgrx::{direct_function_call, PgRelation};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Formatter};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::TryInto;
+use std::fmt::Debug;
 use std::ops::Deref;
 use std::str::FromStr;
-use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct TokenEntry {
-    pub type_: String,
+    pub type_: Cow<'static, str>,
     pub array_index: u32,
     pub position: u32,
     pub start_offset: u64,
@@ -27,19 +29,54 @@ enum DataType {
     String,
     Integer,
     Float,
+    Date,
+    Bool,
 }
 
+#[derive(Debug)]
 pub struct DocumentHighlighter<'a> {
-    lookup: HashMap<String, Vec<TokenEntry>>,
+    lookup: BTreeMap<Cow<'a, str>, Vec<TokenEntry>>,
     data_type: Option<DataType>,
-    index: &'a PgRelation,
     field: String,
+    index_oid: pg_sys::Oid,
 }
 
-impl<'a> Debug for DocumentHighlighter<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}::{:?}={:#?}", self.field, self.data_type, self.lookup)
+#[rustfmt::skip]
+fn make_date(s: &str) -> Option<pgrx::TimestampWithTimeZone> {
+    unsafe {
+        let date_str = s.as_pg_cstr();
+        let date: Option<TimestampWithTimeZone> = PgTryBuilder::new(|| {
+            direct_function_call(
+                pg_sys::timestamptz_in,
+                &[
+                    Some(pg_sys::Datum::from(date_str)),
+                    InvalidOid.into_datum(),
+                    (-1i32).into_datum(),
+                ],
+            )
+        })
+        .catch_when(PgSqlErrorCode::ERRCODE_DATETIME_FIELD_OVERFLOW, |_| None)
+        .catch_when(PgSqlErrorCode::ERRCODE_INVALID_TIME_ZONE_DISPLACEMENT_VALUE, |_| None)
+        .catch_when(PgSqlErrorCode::ERRCODE_INVALID_DATETIME_FORMAT, |_| None)
+        .execute();
+        pg_sys::pfree(date_str.cast());
+        
+        date
     }
+}
+
+macro_rules! compare_date {
+    ($left:tt, $cmp:tt, $right:tt) => {{
+        let token = make_date($left);
+        let term = make_date($right);
+        if token.is_none() || term.is_none() {
+            return false;
+        }
+        let token: i64 = token.unwrap().into();
+        let term: i64 = term.unwrap().into();
+
+        token.$cmp(&term)
+    }};
 }
 
 macro_rules! compare_float {
@@ -75,20 +112,40 @@ macro_rules! compare_integer {
     }};
 }
 
+pub type HighlightMatches<'a> = Vec<(&'a Cow<'a, str>, &'a TokenEntry)>;
+pub type HighlightCollection<'a> = Vec<((QualifiedField, String), HighlightMatches<'a>)>;
+
 impl<'a> DocumentHighlighter<'a> {
-    pub fn new(index: &'a PgRelation, field: &str, text: &str) -> Self {
-        DocumentHighlighter::from_json(index, field, &Value::String(text.into()), 0)
+    pub fn new(index: &PgRelation, field: &str, value: &'a Value) -> Self {
+        if let Value::String(_) = value {
+            let (field_type, _, index_analyzer) = get_highlight_analysis_info(index, field);
+            let is_date = has_date_subfield(index, field);
+            DocumentHighlighter::from_json(
+                index,
+                field,
+                value,
+                0,
+                &field_type,
+                is_date,
+                &index_analyzer,
+            )
             .into_iter()
             .next()
             .unwrap()
             .1
+        } else {
+            panic!("supplied `value` is not a Value::String")
+        }
     }
 
     pub fn from_json(
-        index: &'a PgRelation,
+        index: &PgRelation,
         field: &str,
-        value: &Value,
+        value: &'a Value,
         array_index: u32,
+        field_type: &Option<String>,
+        is_date: bool,
+        index_analyzer: &Option<String>,
     ) -> HashMap<(String, u32), Self> {
         match value {
             Value::Object(o) => {
@@ -102,6 +159,9 @@ impl<'a> DocumentHighlighter<'a> {
                         &format!("{}.{}", field, k),
                         v,
                         array_index,
+                        field_type,
+                        is_date,
+                        index_analyzer,
                     ))
                 });
 
@@ -119,6 +179,9 @@ impl<'a> DocumentHighlighter<'a> {
                         field,
                         v,
                         array_index + i as u32,
+                        field_type,
+                        is_date,
+                        index_analyzer,
                     ))
                 });
 
@@ -127,13 +190,21 @@ impl<'a> DocumentHighlighter<'a> {
 
             _ => {
                 let mut result = DocumentHighlighter {
-                    lookup: HashMap::with_capacity(150),
+                    lookup: Default::default(),
                     data_type: None,
-                    index,
                     field: field.into(),
+                    index_oid: index.oid(),
                 };
 
-                result.analyze_document(field, value, array_index);
+                result.analyze_document(
+                    index,
+                    field,
+                    value,
+                    array_index,
+                    &field_type,
+                    is_date,
+                    &index_analyzer,
+                );
 
                 let mut highlighters = HashMap::new();
                 highlighters.insert((field.into(), array_index), result);
@@ -142,168 +213,287 @@ impl<'a> DocumentHighlighter<'a> {
         }
     }
 
-    fn analyze_document(&mut self, field: &str, value: &Value, array_index: u32) {
+    fn analyze_document(
+        &mut self,
+        index: &PgRelation,
+        field: &str,
+        value: &'a Value,
+        array_index: u32,
+        field_type: &Option<String>,
+        is_date: bool,
+        analyzer: &Option<String>,
+    ) {
         match value {
+            Value::Bool(b) => {
+                self.lookup
+                    .entry(Cow::Owned(b.to_string()))
+                    .or_default()
+                    .push(TokenEntry {
+                        type_: "<BOOLEAN>".into(),
+                        array_index,
+                        position: 1,
+                        start_offset: 0,
+                        end_offset: 0,
+                    });
+                self.data_type = Some(DataType::Bool);
+            }
+
             Value::Number(number) => {
                 if number.is_f64() {
                     self.lookup
-                        .entry(number.as_f64().unwrap().to_string())
-                        .or_insert(vec![TokenEntry {
-                            type_: "<FLOAT>".to_string(),
+                        .entry(Cow::Owned(number.as_f64().unwrap().to_string()))
+                        .or_default()
+                        .push(TokenEntry {
+                            type_: "<FLOAT>".into(),
                             array_index,
                             position: 1,
                             start_offset: 0,
                             end_offset: 0,
-                        }]);
+                        });
                     self.data_type = Some(DataType::Float);
                 } else if number.is_u64() {
                     self.lookup
-                        .entry(number.as_u64().unwrap().to_string())
-                        .or_insert(vec![TokenEntry {
-                            type_: "<UNSIGNED_INT>".to_string(),
+                        .entry(Cow::Owned(number.as_u64().unwrap().to_string()))
+                        .or_default()
+                        .push(TokenEntry {
+                            type_: "<UNSIGNED_INT>".into(),
                             array_index,
                             position: 1,
                             start_offset: 0,
                             end_offset: 0,
-                        }]);
+                        });
                     self.data_type = Some(DataType::Integer);
                 } else {
                     self.lookup
-                        .entry(number.as_i64().unwrap().to_string())
-                        .or_insert(vec![TokenEntry {
-                            type_: "<SIGNED_INT>".to_string(),
+                        .entry(Cow::Owned(number.as_i64().unwrap().to_string()))
+                        .or_default()
+                        .push(TokenEntry {
+                            type_: "<SIGNED_INT>".into(),
                             array_index,
                             position: 1,
                             start_offset: 0,
                             end_offset: 0,
-                        }]);
+                        });
                     self.data_type = Some(DataType::Integer);
                 }
             }
 
-            Value::String(s) => {
-                let results: Box<dyn Iterator<Item = Token>> = if s.len() < 100 * 1024 * 1024 {
-                    // it's a "small" document, so we'll ask ES to analyze it
-                    let es = Elasticsearch::new(self.index);
-                    Box::new(
-                        es.analyze_with_field(field, &s)
-                            .execute()
-                            .expect("failed to analyze text for highlighting")
-                            .tokens
-                            .into_iter(),
-                    )
-                } else {
-                    // it's a "large" document, so we'll tokenize it ourselves, assuming
-                    // 1) that splitting on unicode words is okay; and
-                    // 2) that lowercase tokens is what we want
-                    Box::new(s.unicode_word_indices().enumerate().map(
-                        |(position, (start_offset, token))| Token {
-                            type_: "<ALPHANUM>".to_string(),
-                            token: token.to_lowercase().to_string(),
-                            position: position as i32,
-                            start_offset: start_offset as i64,
-                            end_offset: (start_offset + token.len()) as i64,
-                        },
-                    ))
-                };
-
-                for token in results {
-                    let entry = self
-                        .lookup
-                        .entry(token.token)
-                        .or_insert(Vec::with_capacity(5));
-
-                    entry.push(TokenEntry {
-                        type_: token.type_,
+            Value::String(s) if is_date => {
+                self.lookup
+                    .entry(Cow::Borrowed(s))
+                    .or_default()
+                    .push(TokenEntry {
+                        type_: "<DATE>".into(),
                         array_index,
-                        position: (token.position + 1) as u32,
-                        start_offset: token.start_offset as u64,
-                        end_offset: token.end_offset as u64,
+                        position: 1,
+                        start_offset: 0,
+                        end_offset: 0,
                     });
+                self.data_type = Some(DataType::Date);
+            }
+
+            Value::String(s) => {
+                #[inline]
+                fn map_analyzed_token(
+                    array_index: u32,
+                    token: AnalyzedToken,
+                ) -> (Cow<str>, TokenEntry) {
+                    (
+                        token.token,
+                        TokenEntry {
+                            type_: Cow::Borrowed(token.type_),
+                            array_index,
+                            position: (token.position + 1) as u32,
+                            start_offset: token.start as u64,
+                            end_offset: token.end as u64,
+                        },
+                    )
+                }
+
+                let results: Box<dyn Iterator<Item = (Cow<str>, TokenEntry)>> =
+                    match (analyzer, field_type) {
+                        (None, None) => Box::new(
+                            crate::highlighting::analyze::standard(&s)
+                                .map(|x| map_analyzed_token(array_index, x)),
+                        ),
+
+                        (Some(analyzer), _)
+                            if analyzer == "standard"
+                                || analyzer == "zdb_standard"
+                                || analyzer == "fulltext" =>
+                        {
+                            Box::new(
+                                crate::highlighting::analyze::standard(&s)
+                                    .map(|x| map_analyzed_token(array_index, x)),
+                            )
+                        }
+                        (Some(analyzer), _) if analyzer == "fulltext_with_shingles" => Box::new(
+                            crate::highlighting::analyze::fulltext_with_shingles(&s)
+                                .map(|x| map_analyzed_token(array_index, x)),
+                        ),
+                        (_, Some(field_type)) if field_type == "keyword" => {
+                            let lcase = s.to_lowercase();
+                            let len = lcase.len();
+                            Box::new(std::iter::once((
+                                Cow::Owned(lcase),
+                                TokenEntry {
+                                    type_: "word".into(),
+                                    array_index,
+                                    position: 1,
+                                    start_offset: 0,
+                                    end_offset: len.try_into().unwrap(),
+                                },
+                            )))
+                        }
+                        _ => {
+                            let es = Elasticsearch::new(index);
+                            Box::new(
+                                es.analyze_with_field(field, &s)
+                                    .execute()
+                                    .expect("failed to analyze text for highlighting")
+                                    .tokens
+                                    .into_iter()
+                                    .map(|token| {
+                                        (
+                                            Cow::Owned(token.token),
+                                            TokenEntry {
+                                                type_: Cow::Owned(token.type_),
+                                                array_index,
+                                                position: (<i32 as TryInto<u32>>::try_into(
+                                                    token.position,
+                                                )
+                                                .expect("position overflowed"))
+                                                    + 1,
+                                                start_offset: token
+                                                    .start_offset
+                                                    .try_into()
+                                                    .expect("start_offset overflowed"),
+                                                end_offset: token
+                                                    .end_offset
+                                                    .try_into()
+                                                    .expect("end_offset overflowed"),
+                                            },
+                                        )
+                                    }),
+                            )
+                        }
+                    };
+
+                for (token, entry) in results {
+                    pgrx::check_for_interrupts!();
+                    self.lookup.entry(token).or_default().push(entry);
                 }
                 self.data_type = Some(DataType::String);
             }
 
-            Value::Array(values) => values
-                .iter()
-                .enumerate()
-                .for_each(|(idx, v)| self.analyze_document(field, v, array_index + (idx as u32))),
+            Value::Array(values) => values.iter().enumerate().for_each(|(idx, v)| {
+                self.analyze_document(
+                    index,
+                    field,
+                    v,
+                    array_index + (idx as u32),
+                    field_type,
+                    is_date,
+                    analyzer,
+                )
+            }),
 
             Value::Object(o) => {
                 o.iter().for_each(|(k, v)| {
-                    self.analyze_document(&format!("{}.{}", field, k), v, array_index);
+                    self.analyze_document(
+                        index,
+                        &format!("{}.{}", field, k),
+                        v,
+                        array_index,
+                        field_type,
+                        is_date,
+                        analyzer,
+                    );
                 });
             }
 
             Value::Null => { /* noop */ }
-
-            _ => unimplemented!("Cannot highlight value: {:#?}", value),
         }
     }
 
     pub fn gt_func(&self) -> fn(&str, &str) -> bool {
-        match self.data_type.as_ref().unwrap() {
-            DataType::String => str::gt,
-            DataType::Float => |token: &str, term: &str| compare_float!(token, gt, term),
-            DataType::Integer => |token: &str, term: &str| compare_integer!(token, gt, term),
+        match &self.data_type {
+            Some(DataType::String) => str::gt,
+            Some(DataType::Float) => |token: &str, term: &str| compare_float!(token, gt, term),
+            Some(DataType::Integer) => |token: &str, term: &str| compare_integer!(token, gt, term),
+            Some(DataType::Date) => |token: &str, term: &str| compare_date!(token, gt, term),
+            Some(DataType::Bool) => |_, _| false,
+            None => |_, _| false,
         }
     }
 
     pub fn lt_func(&self) -> fn(&str, &str) -> bool {
-        match self.data_type.as_ref().unwrap() {
-            DataType::String => str::lt,
-            DataType::Float => |token: &str, term: &str| compare_float!(token, lt, term),
-            DataType::Integer => |token: &str, term: &str| compare_integer!(token, lt, term),
+        match &self.data_type {
+            Some(DataType::String) => str::lt,
+            Some(DataType::Float) => |token: &str, term: &str| compare_float!(token, lt, term),
+            Some(DataType::Integer) => |token: &str, term: &str| compare_integer!(token, lt, term),
+            Some(DataType::Date) => |token: &str, term: &str| compare_date!(token, lt, term),
+            Some(DataType::Bool) => |_, _| false,
+            None => |_, _| false,
         }
     }
 
     pub fn ge_func(&self) -> fn(&str, &str) -> bool {
-        match self.data_type.as_ref().unwrap() {
-            DataType::String => str::ge,
-            DataType::Float => |token: &str, term: &str| compare_float!(token, ge, term),
-            DataType::Integer => |token: &str, term: &str| compare_integer!(token, ge, term),
+        match &self.data_type {
+            Some(DataType::String) => str::ge,
+            Some(DataType::Float) => |token: &str, term: &str| compare_float!(token, ge, term),
+            Some(DataType::Integer) => |token: &str, term: &str| compare_integer!(token, ge, term),
+            Some(DataType::Date) => |token: &str, term: &str| compare_date!(token, ge, term),
+            Some(DataType::Bool) => |token: &str, term: &str| token == term,
+            None => |_, _| false,
         }
     }
 
     pub fn le_func(&self) -> fn(&str, &str) -> bool {
-        match self.data_type.as_ref().unwrap() {
-            DataType::String => str::le,
-            DataType::Float => |token: &str, term: &str| compare_float!(token, le, term),
-            DataType::Integer => |token: &str, term: &str| compare_integer!(token, le, term),
+        match &self.data_type {
+            Some(DataType::String) => str::le,
+            Some(DataType::Float) => |token: &str, term: &str| compare_float!(token, le, term),
+            Some(DataType::Integer) => |token: &str, term: &str| compare_integer!(token, le, term),
+            Some(DataType::Date) => |token: &str, term: &str| compare_date!(token, le, term),
+            Some(DataType::Bool) => |token: &str, term: &str| token == term,
+            None => |_, _| false,
         }
     }
 
-    pub fn highlight_term(&'a self, term: &Term) -> Option<Vec<(String, &'a TokenEntry)>> {
+    pub fn highlight_term(&'a self, term: &Term) -> Option<HighlightMatches<'a>> {
         match term {
             Term::MatchAll => None,
+            Term::MatchNone => None,
             Term::String(s, _) => self.highlight_token(s),
             Term::Prefix(s, _) => self.highlight_wildcard(s),
             Term::PhrasePrefix(_, _) => unimplemented!("prefix phrases cannot be highlighted"),
             Term::Phrase(s, _) | Term::PhraseWithWildcard(s, _) => {
-                self.highlight_phrase(self.index, &self.field, s)
+                self.highlight_phrase(&self.field, s)
             }
             Term::Wildcard(w, _) => self.highlight_wildcard(w),
             Term::Regex(r, _) => self.highlight_regex(r),
             Term::Fuzzy(f, p, _) => self.highlight_fuzzy(f, *p),
             Term::Range(_, _, _) => unimplemented!(),
-            Term::Null => unimplemented!(),
+            Term::Null => self.highlight_null(),
             Term::ParsedArray(_, _) => unimplemented!(),
             Term::UnparsedArray(_, _) => unimplemented!(),
             Term::ProximityChain(v) => self.highlight_proximity(v),
         }
     }
 
-    pub fn highlight_token(&'a self, token: &str) -> Option<Vec<(String, &'a TokenEntry)>> {
-        let token = token.to_lowercase();
-        let mut result = Vec::new();
-        let token_entries_vec = self.lookup.get(&token);
+    pub fn highlight_null(&'a self) -> Option<HighlightMatches<'a>> {
+        if self.lookup.is_empty() {
+            Some(vec![])
+        } else {
+            None
+        }
+    }
+
+    pub fn highlight_token(&'a self, token: &str) -> Option<HighlightMatches<'a>> {
+        let token = Cow::Owned(token.to_lowercase());
+        let token_entries_vec = self.lookup.get_key_value(&token);
         match token_entries_vec {
-            Some(vec) => {
-                for token_entry in vec {
-                    result.push((token.clone(), token_entry))
-                }
-                Some(result)
-            }
+            Some((token, vec)) => Some(vec.into_iter().map(|e| (token, e)).collect()),
             None => None,
         }
     }
@@ -312,13 +502,13 @@ impl<'a> DocumentHighlighter<'a> {
         &'a self,
         term: &str,
         eval: F,
-    ) -> Option<Vec<(String, &'a TokenEntry)>> {
+    ) -> Option<HighlightMatches<'a>> {
         let term = term.to_lowercase();
         let mut result = Vec::new();
         for (token, entries) in &self.lookup {
             if eval(token, &term) {
                 for entry in entries {
-                    result.push((token.clone(), entry))
+                    result.push((token, entry))
                 }
             }
         }
@@ -330,7 +520,7 @@ impl<'a> DocumentHighlighter<'a> {
         }
     }
 
-    pub fn highlight_wildcard(&'a self, token: &str) -> Option<Vec<(String, &'a TokenEntry)>> {
+    pub fn highlight_wildcard(&'a self, token: &str) -> Option<HighlightMatches<'a>> {
         let token = token.to_lowercase();
         let _char_looking_for_asterisk = '*';
         let _char_looking_for_question = '?';
@@ -341,6 +531,9 @@ impl<'a> DocumentHighlighter<'a> {
             } else if char == _char_looking_for_asterisk {
                 new_regex.push('.');
                 new_regex.push(char);
+            } else if char == '$' {
+                new_regex.push('\\');
+                new_regex.push(char);
             } else {
                 new_regex.push(char);
             }
@@ -349,13 +542,13 @@ impl<'a> DocumentHighlighter<'a> {
         self.highlight_regex(new_regex.deref())
     }
 
-    pub fn highlight_regex(&'a self, regex: &str) -> Option<Vec<(String, &'a TokenEntry)>> {
+    pub fn highlight_regex(&'a self, regex: &str) -> Option<HighlightMatches<'a>> {
         let regex = Regex::new(regex).unwrap();
         let mut result = Vec::new();
         for (key, token_entries) in self.lookup.iter() {
             if regex.is_match(key) {
                 for token_entry in token_entries {
-                    result.push((key.clone(), token_entry));
+                    result.push((key, token_entry));
                 }
             }
         }
@@ -366,11 +559,7 @@ impl<'a> DocumentHighlighter<'a> {
         }
     }
 
-    pub fn highlight_fuzzy(
-        &'a self,
-        fuzzy_key: &str,
-        prefix: u8,
-    ) -> Option<Vec<(String, &'a TokenEntry)>> {
+    pub fn highlight_fuzzy(&'a self, fuzzy_key: &str, prefix: u8) -> Option<HighlightMatches<'a>> {
         let fuzzy_key = fuzzy_key.to_lowercase();
         let mut result = Vec::new();
         let fuzzy_low = 3;
@@ -384,19 +573,19 @@ impl<'a> DocumentHighlighter<'a> {
                 if fuzzy_key.len() < fuzzy_low {
                     if levenshtein(token, &fuzzy_key) as i32 == 0 {
                         for token_entry in token_entries {
-                            result.push((String::from(token), token_entry));
+                            result.push((token, token_entry));
                         }
                     }
                 } else if fuzzy_key.len() >= fuzzy_low && fuzzy_key.len() < fuzzy_high {
                     if levenshtein(token, &fuzzy_key) as i32 <= 1 {
                         for token_entry in token_entries {
-                            result.push((String::from(token), token_entry));
+                            result.push((token, token_entry));
                         }
                     }
                 } else {
                     if levenshtein(token, &fuzzy_key) as i32 <= 2 {
                         for token_entry in token_entries {
-                            result.push((String::from(token), token_entry));
+                            result.push((token, token_entry));
                         }
                     }
                 }
@@ -411,10 +600,9 @@ impl<'a> DocumentHighlighter<'a> {
 
     pub fn highlight_phrase(
         &'a self,
-        index: &PgRelation,
         field: &str,
         phrase_str: &str,
-    ) -> Option<Vec<(String, &'a TokenEntry)>> {
+    ) -> Option<HighlightMatches<'a>> {
         if phrase_str.is_empty() {
             return None;
         }
@@ -422,7 +610,9 @@ impl<'a> DocumentHighlighter<'a> {
         let phrase_str = phrase_str.to_lowercase();
         let prox_term = ProximityTerm::make_proximity_chain(
             &QualifiedField {
-                index: Some(IndexLink::from_relation(index)),
+                index: Some(IndexLink::from_relation(unsafe {
+                    &PgRelation::open(self.index_oid)
+                })),
                 field: field.to_string(),
             },
             &phrase_str,
@@ -438,46 +628,59 @@ impl<'a> DocumentHighlighter<'a> {
     //
     // query= than w/2 wine
     // query= than wo/2 (wine or beer or cheese or food) w/5 cowbell
-    pub fn highlight_proximity<'b>(
+    pub fn highlight_proximity(
         &'a self,
         phrase: &Vec<ProximityPart>,
-    ) -> Option<Vec<(String, &'a TokenEntry)>> {
+    ) -> Option<HighlightMatches<'a>> {
         if phrase.len() == 0 {
             return None;
         }
 
-        let first_words = phrase.get(0).unwrap();
-        let mut final_matches = HashSet::new();
+        let first_part = phrase.get(0).unwrap();
+        let mut final_matches = Vec::new();
 
-        for word in &first_words.words {
-            let first_word_entries = self.highlight_term(&word.to_term());
+        let phrase2 = phrase
+            .into_iter()
+            .map(|p| {
+                (
+                    p,
+                    ProximityTerm::to_terms(&p.words)
+                        .into_iter()
+                        .filter_map(|t| {
+                            self.highlight_term(&t).map(|highlights| {
+                                (highlights, matches!(t, Term::ProximityChain(_)))
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
 
-            if phrase.len() == 1 || first_word_entries.is_none() {
-                return first_word_entries;
-            }
+        for word in &first_part.words {
+            let first_word_entries = match self.highlight_term(&word.to_term()) {
+                None => continue,
+                Some(first_word_entries) if phrase.len() == 1 => return Some(first_word_entries),
+                Some(first_word_entries) => first_word_entries,
+            };
 
-            let first_word_entries = first_word_entries.unwrap().into_iter();
-            for e in first_word_entries {
-                let array_index = e.1.array_index;
-                let mut start = vec![e.1.position]; // 0
+            for (token, token_entry) in first_word_entries {
+                let array_index = token_entry.array_index;
+                let mut start = vec![token_entry.position]; // 0
                 let mut possibilities = Vec::new();
                 let mut is_valid = true;
 
-                possibilities.push(e);
+                possibilities.push((token, token_entry));
 
-                let mut iter = phrase.iter().peekable();
-                while let Some(current) = iter.next() {
-                    let next = iter.peek();
-                    if next.is_none() {
-                        break;
-                    }
-                    let next = next.unwrap();
+                let mut iter = phrase2.iter().peekable();
+                while let Some((current, _matches)) = iter.next() {
+                    let next = match iter.peek() {
+                        Some(next) => next,
+                        None => break,
+                    };
 
                     let distance = current.distance.as_ref().map_or(0, |v| v.distance);
                     let order = current.distance.as_ref().map_or(false, |v| v.in_order);
-                    let words = ProximityTerm::to_terms(&next.words);
-
-                    match self.look_for_match(&words, distance, order, start, array_index) {
+                    match self.look_for_match_ex(&next.1, distance, order, start, array_index) {
                         None => {
                             is_valid = false;
                             break;
@@ -487,15 +690,13 @@ impl<'a> DocumentHighlighter<'a> {
                                 .iter()
                                 .map(|e| e.1.position)
                                 .collect::<Vec<u32>>();
-                            next_entries.into_iter().for_each(|e| possibilities.push(e));
+                            possibilities.extend(next_entries);
                         }
                     }
                 }
 
                 if is_valid {
-                    possibilities.into_iter().for_each(|e| {
-                        final_matches.insert(e);
-                    });
+                    final_matches.extend(possibilities);
                 }
             }
         }
@@ -503,48 +704,72 @@ impl<'a> DocumentHighlighter<'a> {
         if final_matches.is_empty() {
             None
         } else {
-            Some(
-                final_matches
-                    .into_iter()
-                    .collect::<Vec<(String, &TokenEntry)>>(),
-            )
+            Some(final_matches)
         }
     }
 
+    #[allow(dead_code)]
     fn look_for_match(
-        &self,
+        &'a self,
         words: &Vec<Term>,
         distance: u32,
         order: bool,
         starting_point: Vec<u32>,
         array_index: u32,
-    ) -> Option<HashSet<(String, &TokenEntry)>> {
-        let mut matches = HashSet::new();
-        for word in words {
-            match self.highlight_term(word) {
-                None => {}
-                Some(entries) => {
-                    for e in entries {
-                        for point in &starting_point {
-                            if e.1.array_index == array_index {
-                                if order {
-                                    if *point < e.1.position && e.1.position - point <= distance + 1
-                                    {
-                                        matches.insert(e.clone());
-                                    }
-                                } else {
-                                    if (*point as i32 - e.1.position as i32).abs()
-                                        <= distance as i32 + 1
-                                    {
-                                        matches.insert(e.clone());
-                                    }
-                                }
+    ) -> Option<HighlightMatches<'a>> {
+        let words = words
+            .into_iter()
+            .filter_map(|t| {
+                self.highlight_term(t)
+                    .map(|highlights| (highlights, matches!(t, Term::ProximityChain(_))))
+            })
+            .collect::<Vec<_>>();
+        self.look_for_match_ex(&words, distance, order, starting_point, array_index)
+    }
+
+    fn look_for_match_ex(
+        &'a self,
+        words: &Vec<(HighlightMatches<'a>, bool)>,
+        distance: u32,
+        order: bool,
+        starting_point: Vec<u32>,
+        _array_index: u32, // NB:  Pretty sure we don't need to care about the array_index for proximity clauses
+    ) -> Option<HighlightMatches<'a>> {
+        let mut matches = Vec::new();
+        for (highlights, is_prox_chain) in words {
+            let mut highlights = highlights
+                .iter()
+                .map(|(cow, entry)| (*cow, *entry))
+                .collect::<HighlightMatches>();
+            highlights.sort_by_key(|(_, entry)| entry.position);
+            for start in &starting_point {
+                let start = *start;
+                let range = if order {
+                    start + 1..=start + 1 + distance
+                } else {
+                    (start as i64 - 1 - distance as i64).max(1) as u32..=start + 1 + distance
+                };
+
+                for point in range {
+                    if point != start {
+                        while let Ok(idx) =
+                            highlights.binary_search_by(|(_, entry)| entry.position.cmp(&point))
+                        {
+                            if *is_prox_chain {
+                                matches.append(&mut highlights);
+                            } else {
+                                let e = highlights.get(idx).unwrap();
+                                matches.push(*e);
+                            }
+                            if !highlights.is_empty() {
+                                highlights.remove(idx);
                             }
                         }
                     }
                 }
             }
         }
+
         return if matches.is_empty() {
             None
         } else {
@@ -557,10 +782,11 @@ impl<'a> DocumentHighlighter<'a> {
 fn highlight_term(
     index: PgRelation,
     field_name: &str,
-    text: &str,
+    text: String,
     token_to_highlight: String,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(field_name, String),
         name!(term, String),
         name!(type, String),
@@ -569,10 +795,11 @@ fn highlight_term(
         name!(end_offset, i64),
     ),
 > {
-    let highlighter = DocumentHighlighter::new(&index, field_name, text);
+    let value = serde_json::Value::String(text);
+    let highlighter = DocumentHighlighter::new(&index, field_name, &value);
     let highlights = highlighter.highlight_token(&token_to_highlight);
 
-    match highlights {
+    TableIterator::new(match highlights {
         Some(vec) => vec
             .iter()
             .map(|e| {
@@ -588,17 +815,18 @@ fn highlight_term(
             .collect::<Vec<(String, String, String, i32, i64, i64)>>()
             .into_iter(),
         None => Vec::<(String, String, String, i32, i64, i64)>::new().into_iter(),
-    }
+    })
 }
 
 #[pg_extern(immutable, parallel_safe)]
 fn highlight_phrase(
     index: PgRelation,
     field_name: &str,
-    text: &str,
+    text: String,
     tokens_to_highlight: &str,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(field_name, String),
         name!(term, String),
         name!(type, String),
@@ -607,10 +835,11 @@ fn highlight_phrase(
         name!(end_offset, i64),
     ),
 > {
-    let highlighter = DocumentHighlighter::new(&index, field_name, text);
-    let highlights = highlighter.highlight_phrase(&index, field_name, tokens_to_highlight);
+    let value = serde_json::Value::String(text);
+    let highlighter = DocumentHighlighter::new(&index, field_name, &value);
+    let highlights = highlighter.highlight_phrase(field_name, tokens_to_highlight);
 
-    match highlights {
+    TableIterator::new(match highlights {
         Some(vec) => vec
             .iter()
             .map(|e| {
@@ -626,17 +855,18 @@ fn highlight_phrase(
             .collect::<Vec<(String, String, String, i32, i64, i64)>>()
             .into_iter(),
         None => Vec::<(String, String, String, i32, i64, i64)>::new().into_iter(),
-    }
+    })
 }
 
 #[pg_extern(immutable, parallel_safe)]
 fn highlight_wildcard(
     index: PgRelation,
     field_name: &str,
-    text: &str,
+    text: String,
     token_to_highlight: &str,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(field_name, String),
         name!(term, String),
         name!(type, String),
@@ -645,10 +875,11 @@ fn highlight_wildcard(
         name!(end_offset, i64),
     ),
 > {
-    let highlighter = DocumentHighlighter::new(&index, field_name, text);
+    let value = serde_json::Value::String(text);
+    let highlighter = DocumentHighlighter::new(&index, field_name, &value);
     let highlights = highlighter.highlight_wildcard(token_to_highlight);
 
-    match highlights {
+    TableIterator::new(match highlights {
         Some(vec) => vec
             .iter()
             .map(|e| {
@@ -664,17 +895,18 @@ fn highlight_wildcard(
             .collect::<Vec<(String, String, String, i32, i64, i64)>>()
             .into_iter(),
         None => Vec::<(String, String, String, i32, i64, i64)>::new().into_iter(),
-    }
+    })
 }
 
 #[pg_extern(immutable, parallel_safe)]
 fn highlight_regex(
     index: PgRelation,
     field_name: &str,
-    text: &str,
+    text: String,
     token_to_highlight: &str,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(field_name, String),
         name!(term, String),
         name!(type, String),
@@ -683,10 +915,11 @@ fn highlight_regex(
         name!(end_offset, i64),
     ),
 > {
-    let highlighter = DocumentHighlighter::new(&index, field_name, text);
+    let value = serde_json::Value::String(text);
+    let highlighter = DocumentHighlighter::new(&index, field_name, &value);
     let highlights = highlighter.highlight_regex(token_to_highlight);
 
-    match highlights {
+    TableIterator::new(match highlights {
         Some(vec) => vec
             .iter()
             .map(|e| {
@@ -702,18 +935,19 @@ fn highlight_regex(
             .collect::<Vec<(String, String, String, i32, i64, i64)>>()
             .into_iter(),
         None => Vec::<(String, String, String, i32, i64, i64)>::new().into_iter(),
-    }
+    })
 }
 
 #[pg_extern(immutable, parallel_safe)]
 fn highlight_fuzzy(
     index: PgRelation,
     field_name: &str,
-    text: &str,
+    text: String,
     token_to_highlight: &str,
     prefix: i32,
-) -> impl std::iter::Iterator<
-    Item = (
+) -> TableIterator<
+    'static,
+    (
         name!(field_name, String),
         name!(term, String),
         name!(type, String),
@@ -725,10 +959,11 @@ fn highlight_fuzzy(
     if prefix < 0 {
         panic!("negative prefixes not allowed");
     }
-    let highlighter = DocumentHighlighter::new(&index, field_name, text);
+    let value = serde_json::Value::String(text);
+    let highlighter = DocumentHighlighter::new(&index, field_name, &value);
     let highlights = highlighter.highlight_fuzzy(token_to_highlight, prefix as u8);
 
-    match highlights {
+    TableIterator::new(match highlights {
         Some(vec) => vec
             .iter()
             .map(|e| {
@@ -744,7 +979,7 @@ fn highlight_fuzzy(
             .collect::<Vec<(String, String, String, i32, i64, i64)>>()
             .into_iter(),
         None => Vec::<(String, String, String, i32, i64, i64)>::new().into_iter(),
-    }
+    })
 }
 
 //  select zdb.highlight_proximity('idx_test','test','this is a test', ARRAY['{"word": "this", distance:2, in_order: false}'::proximitypart, '{"word": "test", distance: 0, in_order: false}'::proximitypart]);
@@ -752,10 +987,12 @@ fn highlight_fuzzy(
 fn highlight_proximity(
     index: PgRelation,
     field_name: &str,
-    text: &str,
+    text: String,
     prox_clause: Vec<Option<ProximityPart>>,
-) -> impl std::iter::Iterator<
-    Item = (
+    dedup_results: default!(bool, true),
+) -> TableIterator<
+    'static,
+    (
         name!(field_name, String),
         name!(term, String),
         name!(type, String),
@@ -768,10 +1005,11 @@ fn highlight_proximity(
         .into_iter()
         .map(|e| e.unwrap())
         .collect::<Vec<ProximityPart>>();
-    let highlighter = DocumentHighlighter::new(&index, field_name, text);
+    let value = serde_json::Value::String(text);
+    let highlighter = DocumentHighlighter::new(&index, field_name, &value);
     let highlights = highlighter.highlight_proximity(&prox_clause);
 
-    match highlights {
+    let iter = match highlights {
         Some(vec) => vec
             .iter()
             .map(|e| {
@@ -787,18 +1025,27 @@ fn highlight_proximity(
             .collect::<Vec<(String, String, String, i32, i64, i64)>>()
             .into_iter(),
         None => Vec::<(String, String, String, i32, i64, i64)>::new().into_iter(),
-    }
+    };
+
+    let iter: Box<dyn Iterator<Item = _>> = if dedup_results {
+        use std::collections::HashSet;
+        Box::new(iter.collect::<HashSet<_>>().into_iter())
+    } else {
+        Box::new(iter)
+    };
+    TableIterator::new(iter)
 }
 
 #[cfg(any(test, feature = "pg_test"))]
-#[pgx_macros::pg_schema]
+#[pgrx::pg_schema]
 mod tests {
     use crate::highlighting::document_highlighter::{DocumentHighlighter, TokenEntry};
     use crate::zql::ast::Term;
-    use pgx::*;
+    use pgrx::spi::SpiTupleTable;
+    use pgrx::*;
     use regex::Regex;
     use serde_json::*;
-    use std::collections::HashSet;
+    use std::borrow::Cow;
 
     #[pg_test(error = "no matches found")]
     #[initialize(es = true)]
@@ -809,7 +1056,8 @@ mod tests {
         let index = unsafe {
             PgRelation::open_with_name("idxtest_highlighting_look_for_match_none").unwrap()
         };
-        let dh = DocumentHighlighter::new(&index, "test_field", "this is a test");
+        let value = serde_json::Value::String("this is a test".into());
+        let dh = DocumentHighlighter::new(&index, "test_field", &value);
 
         let matches = dh
             .look_for_match(
@@ -832,23 +1080,24 @@ mod tests {
         let index = unsafe {
             PgRelation::open_with_name("idxtest_highlighting_look_for_match_in_order").unwrap()
         };
-        let dh = DocumentHighlighter::new(&index, "test_field", "this is a test");
+        let value = serde_json::Value::String("this is a test".into());
+        let dh = DocumentHighlighter::new(&index, "test_field", &value);
 
         let matches = dh
             .look_for_match(&vec![Term::String("is".into(), None)], 0, true, vec![1], 0)
             .expect("no matches found");
-        let mut expected = HashSet::new();
+        let mut expected = Vec::new();
         let value = (
-            "is".to_string(),
+            &Cow::Borrowed("is"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 2,
                 start_offset: 5,
                 end_offset: 7,
             },
         );
-        expected.insert(value);
+        expected.push(value);
         assert_eq!(matches, expected)
     }
 
@@ -860,7 +1109,8 @@ mod tests {
         let index = unsafe {
             PgRelation::open_with_name("idxtest_highlighting_look_for_match_out_of_order").unwrap()
         };
-        let dh = DocumentHighlighter::new(&index, "test_field", "this is a test");
+        let value = serde_json::Value::String("this is a test".into());
+        let dh = DocumentHighlighter::new(&index, "test_field", &value);
 
         let matches = dh
             .look_for_match(
@@ -871,18 +1121,18 @@ mod tests {
                 0,
             )
             .expect("no matches found");
-        let mut expected = HashSet::new();
+        let mut expected = Vec::new();
         let value_one = (
-            "this".to_string(),
+            &Cow::Borrowed("this"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 1,
                 start_offset: 0,
                 end_offset: 4,
             },
         );
-        expected.insert(value_one);
+        expected.push(value_one);
         assert_eq!(matches, expected)
     }
 
@@ -895,11 +1145,8 @@ mod tests {
             PgRelation::open_with_name("idxtest_highlighting_look_for_match_out_of_order_two")
                 .unwrap()
         };
-        let dh = DocumentHighlighter::new(
-            &index,
-            "test_field",
-            "this is a test and this is also a test",
-        );
+        let value = serde_json::Value::String("this is a test and this is also a test".into());
+        let dh = DocumentHighlighter::new(&index, "test_field", &value);
 
         let matches = dh
             .look_for_match(
@@ -910,11 +1157,11 @@ mod tests {
                 0,
             )
             .expect("no matches found");
-        let mut expect = HashSet::new();
+        let mut expected = Vec::new();
         let value_one = (
-            "is".to_string(),
+            &Cow::Borrowed("is"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 2,
                 start_offset: 5,
@@ -922,18 +1169,18 @@ mod tests {
             },
         );
         let value_two = (
-            "is".to_string(),
+            &Cow::Borrowed("is"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 7,
                 start_offset: 24,
                 end_offset: 26,
             },
         );
-        expect.insert(value_one);
-        expect.insert(value_two);
-        assert_eq!(matches, expect)
+        expected.push(value_one);
+        expected.push(value_two);
+        assert_eq!(matches, expected)
     }
 
     #[pg_test]
@@ -945,11 +1192,8 @@ mod tests {
             PgRelation::open_with_name("idxtest_highlighting_look_for_match_out_of_order_two")
                 .unwrap()
         };
-        let dh = DocumentHighlighter::new(
-            &index,
-            "test_field",
-            "this is a test and this is also a test",
-        );
+        let value = serde_json::Value::String("this is a test and this is also a test".into());
+        let dh = DocumentHighlighter::new(&index, "test_field", &value);
 
         let matches = dh
             .look_for_match(
@@ -960,11 +1204,11 @@ mod tests {
                 0,
             )
             .expect("no matches found");
-        let mut expect = HashSet::new();
+        let mut expected = Vec::new();
         let value_one = (
-            "this".to_string(),
+            &Cow::Borrowed("this"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 1,
                 start_offset: 0,
@@ -972,18 +1216,18 @@ mod tests {
             },
         );
         let value_two = (
-            "this".to_string(),
+            &Cow::Borrowed("this"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 6,
                 start_offset: 19,
                 end_offset: 23,
             },
         );
-        expect.insert(value_one);
-        expect.insert(value_two);
-        assert_eq!(matches, expect)
+        expected.push(value_one);
+        expected.push(value_two);
+        assert_eq!(matches, expected)
     }
 
     #[pg_test]
@@ -995,11 +1239,8 @@ mod tests {
             PgRelation::open_with_name("idxtest_highlighting_look_for_match_in_order_two_diff_dist")
                 .unwrap()
         };
-        let dh = DocumentHighlighter::new(
-            &index,
-            "test_field",
-            "this is a test and this is also a test",
-        );
+        let value = serde_json::Value::String("this is a test and this is also a test".into());
+        let dh = DocumentHighlighter::new(&index, "test_field", &value);
 
         let matches = dh
             .look_for_match(
@@ -1010,11 +1251,11 @@ mod tests {
                 0,
             )
             .expect("no matches found");
-        let mut expect = HashSet::new();
+        let mut expected = Vec::new();
         let value_one = (
-            "test".to_string(),
+            &Cow::Borrowed("test"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 4,
                 start_offset: 10,
@@ -1022,18 +1263,18 @@ mod tests {
             },
         );
         let value_two = (
-            "test".to_string(),
+            &Cow::Borrowed("test"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 10,
                 start_offset: 34,
                 end_offset: 38,
             },
         );
-        expect.insert(value_one);
-        expect.insert(value_two);
-        assert_eq!(matches, expect)
+        expected.push(value_one);
+        expected.push(value_two);
+        assert_eq!(matches, expected)
     }
 
     #[pg_test]
@@ -1047,11 +1288,8 @@ mod tests {
             )
             .unwrap()
         };
-        let dh = DocumentHighlighter::new(
-            &index,
-            "test_field",
-            "this is a test and this is also a test",
-        );
+        let value = serde_json::Value::String("this is a test and this is also a test".into());
+        let dh = DocumentHighlighter::new(&index, "test_field", &value);
 
         let matches = dh
             .look_for_match(
@@ -1062,11 +1300,11 @@ mod tests {
                 0,
             )
             .expect("no matches found");
-        let mut expect = HashSet::new();
+        let mut expected = Vec::new();
         let value_one = (
-            "this".to_string(),
+            &Cow::Borrowed("this"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 1,
                 start_offset: 0,
@@ -1074,30 +1312,30 @@ mod tests {
             },
         );
         let value_two = (
-            "this".to_string(),
+            &Cow::Borrowed("this"),
             &TokenEntry {
-                type_: "<ALPHANUM>".to_string(),
+                type_: "<ALPHANUM>".into(),
                 array_index: 0,
                 position: 6,
                 start_offset: 19,
                 end_offset: 23,
             },
         );
-        expect.insert(value_one);
-        expect.insert(value_two);
-        assert_eq!(matches, expect)
+        expected.push(value_one);
+        expected.push(value_two);
+        assert_eq!(matches, expected)
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_term() {
+    fn test_highlighter_term() -> spi::Result<()> {
         let title = "term";
         start_table_and_index(title);
         let select: String = format!(
             "select * from zdb.highlight_term('idxtest_highlighting_{}', 'test_field', 'it is a test and it is a good one', 'it') order by position;", title
         );
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1110,18 +1348,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_phrase() {
+    fn test_highlighter_phrase() -> spi::Result<()> {
         let title = "phrase";
         start_table_and_index(title);
         let select: String = format!("select * from zdb.highlight_phrase('idxtest_highlighting_{}', 'test_field', 'it is a test and it is a good one', 'it is a') order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1142,18 +1380,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_phrase_as_one_word() {
+    fn test_highlighter_phrase_as_one_word() -> spi::Result<()> {
         let title = "phrase_one_word";
         start_table_and_index(title);
         let select: String = format!("select * from zdb.highlight_phrase('idxtest_highlighting_{}', 'test_field', 'it is a test and it is a good one', 'it') order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1166,18 +1404,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_phrase_with_phrase_not_in_text() {
+    fn test_highlighter_phrase_with_phrase_not_in_text() -> spi::Result<()> {
         let title = "phrase_not_in_text";
         start_table_and_index(title);
         let select: String = format!("select * from zdb.highlight_phrase('idxtest_highlighting_{}', 'test_field', 'it is a test and it is a good one', 'banana') order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1185,18 +1423,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_wildcard_with_asterisk() {
+    fn test_highlighter_wildcard_with_asterisk() -> spi::Result<()> {
         let title = "wildcard_ast";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_wildcard('idxtest_highlighting_{}', 'test_field', 'Mom landed a man on the moon', 'm*n') order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name  | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1209,18 +1447,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_wildcard_with_question_mark() {
+    fn test_highlighter_wildcard_with_question_mark() -> spi::Result<()> {
         let title = "wildcard_question";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_wildcard('idxtest_highlighting_{}', 'test_field', 'Mom landed a man on the moon', 'm?n') order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name  | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1229,18 +1467,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_wildcard_with_no_match() {
+    fn test_highlighter_wildcard_with_no_match() -> spi::Result<()> {
         let title = "wildcard_no_match";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_wildcard('idxtest_highlighting_{}', 'test_field', 'Mom landed a man on the moon', 'n*n') order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name  | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1248,18 +1486,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_regex() {
+    fn test_highlighter_regex() -> spi::Result<()> {
         let title = "regex";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_regex('idxtest_highlighting_{}', 'test_field', 'Mom landed a man on the moon', '^m.*$') order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1274,19 +1512,19 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_regex_test_two() {
+    fn test_highlighter_regex_test_two() -> spi::Result<()> {
         let title = "regex_test_two";
         start_table_and_index(title);
         let regex_ex = Regex::new("^m.?$").unwrap();
         let select = format!("select * from zdb.highlight_regex('idxtest_highlighting_{}', 'test_field', 'Mom landed a man on the moon', '{}') order by position;", title, regex_ex.as_str());
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1294,18 +1532,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_fuzzy_correct_three_char_term() {
+    fn test_highlighter_fuzzy_correct_three_char_term() -> spi::Result<()> {
         let title = "fuzzy_three";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_fuzzy('idxtest_highlighting_{}', 'test_field', 'coal colt cot cheese beer co beer colter cat bolt c', 'cot', 1) order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name  | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1322,18 +1560,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_fuzzy_correct_two_char_string() {
+    fn test_highlighter_fuzzy_correct_two_char_string() -> spi::Result<()> {
         let title = "fuzzy_two";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_fuzzy('idxtest_highlighting_{}', 'test_field', 'coal colt cot cheese beer co beer colter cat bolt c', 'co', 1) order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name  | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1342,18 +1580,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_fuzzy_6_char_string() {
+    fn test_highlighter_fuzzy_6_char_string() -> spi::Result<()> {
         let title = "fuzzy_six";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_fuzzy('idxtest_highlighting_{}', 'test_field', 'coal colt cot cheese beer co beer colter cat bolt c cott cooler', 'colter', 2) order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term   |    type    | position | start_offset | end_offset
             // -----------+--------+------------+----------+--------------+------------
@@ -1369,19 +1607,19 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
     // fn test_highlighter_fuzzy_with_prefix_number_longer_then_given_string() {
-    fn test_highlighter_fuzzy_1() {
+    fn test_highlighter_fuzzy_1() -> spi::Result<()> {
         let title = "fuzzy_long_prefix";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_fuzzy('idxtest_highlighting_{}', 'test_field', 'coal colt cot cheese beer co beer colter cat bolt', 'cot', 4) order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1391,19 +1629,19 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
     // fn test_highlighter_fuzzy_with_prefix_number_longer_then_given_string_with_non_return() {
-    fn test_highlighter_fuzzy_2() {
+    fn test_highlighter_fuzzy_2() -> spi::Result<()> {
         let title = "fuzzy_long_prefix_no_return";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_fuzzy('idxtest_highlighting_{}', 'test_field', 'coal colt cot cheese beer co beer colter cat bolt', 'cet', 4) order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1412,18 +1650,18 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test(error = "negative prefixes not allowed")]
     #[initialize(es = true)]
-    fn test_highlighter_fuzzy_with_negative_prefix() {
+    fn test_highlighter_fuzzy_with_negative_prefix() -> spi::Result<()> {
         let title = "fuzzy_neg_prefix";
         start_table_and_index(title);
         let select = format!("select * from zdb.highlight_fuzzy('idxtest_highlighting_{}', 'test_field', 'coal colt cot cheese beer co beer colter cat bolt', 'cet', -4) order by position;", title);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1432,13 +1670,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_two_term() {
+    fn test_highlighter_proximity_two_term() -> spi::Result<()> {
         let title = "highlight_proximity_two_term";
         start_table_and_index(title);
         let array_one = serde_json::to_string(&json! {
@@ -1457,7 +1695,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','this is a test that is longer and has a second this near test a second time and a third this that is not' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1474,13 +1712,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_three_term() {
+    fn test_highlighter_proximity_three_term() -> spi::Result<()> {
         let title = "highlight_proximity_three_term";
         start_table_and_index(title);
         let search_string = "this is a test that is longer and has a second this near test a second time and a third this that is not";
@@ -1507,7 +1745,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // ------------+------+------------+----------+--------------+------------
@@ -1523,13 +1761,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_one_term() {
+    fn test_highlighter_proximity_one_term() -> spi::Result<()> {
         let title = "highlight_proximity_one_term";
         start_table_and_index(title);
         let search_string = "this is a test that is longer and has a second this near test a second time and a third this that is not";
@@ -1542,7 +1780,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart]) order by position;", title, search_string, array_one);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1558,13 +1796,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_three_term_found_twice() {
+    fn test_highlighter_proximity_three_term_found_twice() -> spi::Result<()> {
         let title = "highlight_proximity_three_term_twice";
         start_table_and_index(title);
         let search_string = "this is a test that is longer and has a second this near test a second time and a third that is not this test that whatever ";
@@ -1591,7 +1829,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1613,13 +1851,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_simple_in_order_test() {
+    fn test_highlighter_proximity_simple_in_order_test() -> spi::Result<()> {
         let title = "highlight_proximity_simple_in_order_test";
         start_table_and_index(title);
         let search_string = "this is this";
@@ -1639,7 +1877,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1653,13 +1891,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_simple_without_order_test() {
+    fn test_highlighter_proximity_simple_without_order_test() -> spi::Result<()> {
         let title = "highlight_proximity_simple_without_order_test";
         start_table_and_index(title);
         let search_string = "this is this";
@@ -1679,7 +1917,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1695,13 +1933,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_four_with_inorder_and_not_inorder() {
+    fn test_highlighter_proximity_four_with_inorder_and_not_inorder() -> spi::Result<()> {
         let title = "highlight_proximity_four_with_inorder_and_not_inorder";
         start_table_and_index(title);
         let search_string = "now is the time for all good men to come to the aid of their country.";
@@ -1735,7 +1973,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three, array_four);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1754,13 +1992,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_four_with_inorder_and_not_inorder_doubles_far_apart() {
+    fn test_highlight_prox4_with_ord_and_non_ord_doubles_far_apart() -> spi::Result<()> {
         let title = "highlight_proximity_four_with_inorder_and_not_inorder_double";
         start_table_and_index(title);
         let search_string = "now is the time of the year for all good men to rise up and come to the aid of their country.";
@@ -1794,7 +2032,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three, array_four);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1813,13 +2051,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_long_test() {
+    fn test_highlighter_proximity_long_test() -> spi::Result<()> {
         let title = "highlight_proximity_long_test";
         start_table_and_index(title);
         let search_string = test_blurb();
@@ -1846,7 +2084,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+-----------
@@ -1859,13 +2097,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_two_then_one_in_order() {
+    fn itest_highlighter_proximity_array_two_then_one_in_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_two_then_one_in_order";
         start_table_and_index(title);
         let search_string = "This is a test";
@@ -1885,7 +2123,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1900,13 +2138,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_one_then_two_in_order() {
+    fn test_highlighter_proximity_array_one_then_two_in_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_two_then_one_in_order";
         start_table_and_index(title);
         let search_string = "This is a test";
@@ -1926,7 +2164,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title,search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1941,13 +2179,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_two_then_one_without_order() {
+    fn test_highlighter_proximity_array_two_then_one_without_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_two_then_one_without_order";
         start_table_and_index(title);
         let search_string = "This is a test";
@@ -1967,7 +2205,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -1982,13 +2220,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_one_then_two_without_order() {
+    fn test_highlighter_proximity_array_one_then_two_without_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_two_then_one_without_order";
         start_table_and_index(title);
         let search_string = "This is a test";
@@ -2008,7 +2246,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -2023,13 +2261,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_two_then_two_in_order() {
+    fn test_highlighter_proximity_array_two_then_two_in_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_two_then_two_in_order";
         start_table_and_index(title);
         let search_string = "This is a test that is a bit longer";
@@ -2049,7 +2287,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -2068,13 +2306,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_two_then_two_without_order() {
+    fn test_highlighter_proximity_array_two_then_two_without_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_two_then_two_without_order";
         start_table_and_index(title);
         let search_string = "This is a test that is a bit longer";
@@ -2094,7 +2332,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -2113,13 +2351,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_three_then_three_in_order() {
+    fn test_highlighter_proximity_array_three_then_three_in_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_three_then_three_in_order";
         start_table_and_index(title);
         let search_string =
@@ -2140,7 +2378,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -2161,13 +2399,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_three_then_three_without_order() {
+    fn test_highlighter_proximity_array_three_then_three_without_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_three_then_three_without_order";
         start_table_and_index(title);
         let search_string =
@@ -2188,7 +2426,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -2213,13 +2451,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_three_then_three() {
+    fn test_highlighter_proximity_array_three_then_three() -> spi::Result<()> {
         let title = "highlight_proximity_array_three_then_three_then_three";
         start_table_and_index(title);
         let search_string =
@@ -2247,7 +2485,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             //  field_name | term |    type    | position | start_offset | end_offset
             //  -----------+------+------------+----------+--------------+------------
@@ -2274,13 +2512,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_three_then_three_no_order() {
+    fn test_highlighter_proximity_array_three_then_three_no_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_three_then_three_then_three_no_order";
         start_table_and_index(title);
         let search_string =
@@ -2308,7 +2546,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             //  field_name | term |    type    | position | start_offset | end_offset
             //  -----------+------+------------+----------+--------------+------------
@@ -2329,13 +2567,13 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     #[pg_test]
     #[initialize(es = true)]
-    fn test_highlighter_proximity_array_two_then_three_no_order() {
+    fn test_highlighter_proximity_array_two_then_three_no_order() -> spi::Result<()> {
         let title = "highlight_proximity_array_three_then_three_then_three_no_order";
         start_table_and_index(title);
         let search_string =
@@ -2363,7 +2601,7 @@ mod tests {
         .expect("failed to parse json");
         let select = format!("select * from zdb.highlight_proximity('idxtest_highlighting_{}', 'test_field','{}' ,  ARRAY['{}'::proximitypart, '{}'::proximitypart, '{}'::proximitypart]) order by position;", title, search_string, array_one, array_two, array_three);
         Spi::connect(|client| {
-            let table = client.select(&select, None, None);
+            let table = client.select(&select, None, None)?;
 
             // field_name | term |    type    | position | start_offset | end_offset
             // -----------+------+------------+----------+--------------+------------
@@ -2384,8 +2622,8 @@ mod tests {
 
             test_table(table, expect);
 
-            Ok(Some(()))
-        });
+            Ok(())
+        })
     }
 
     fn start_table_and_index(title: &str) {
@@ -2393,19 +2631,19 @@ mod tests {
             "CREATE TABLE test_highlighting_{} AS SELECT * FROM generate_series(1, 10);",
             title,
         );
-        Spi::run(create_table);
+        Spi::run(create_table).expect("SPI failed");
         let create_index = &format!("CREATE INDEX idxtest_highlighting_{} ON test_highlighting_{} USING zombodb ((test_highlighting_{}.*))", title, title, title, );
-        Spi::run(create_index);
+        Spi::run(create_index).expect("SPI failed");
     }
 
     fn test_table(mut table: SpiTupleTable, expect: Vec<(&str, &str, i32, i64, i64)>) {
         let mut i = 0;
         while let Some(_) = table.next() {
-            let token = table.get_datum::<&str>(2).unwrap();
-            let ttype = table.get_datum::<&str>(3).unwrap();
-            let pos = table.get_datum::<i32>(4).unwrap();
-            let start_offset = table.get_datum::<i64>(5).unwrap();
-            let end_offset = table.get_datum::<i64>(6).unwrap();
+            let token = table.get::<&str>(2).expect("SPI failed").unwrap();
+            let ttype = table.get::<&str>(3).expect("SPI failed").unwrap();
+            let pos = table.get::<i32>(4).expect("SPI failed").unwrap();
+            let start_offset = table.get::<i64>(5).expect("SPI failed").unwrap();
+            let end_offset = table.get::<i64>(6).expect("SPI failed").unwrap();
 
             let row_tuple = (ttype, token, pos, start_offset, end_offset);
 
